@@ -44,7 +44,7 @@ pip install -r requirements.txt
 
 ##### `sound_speed.py`
 - Defines the sound speed profile \( c(r, z) \) and its spatial gradients:
-  - \( \frac{\partial c}{\partial r} \), \( \frac{\partial c}{\partial z} \), and higher-order derivatives.
+  - $\( \frac{\partial c}{\partial r} \), \( \frac{\partial c}{\partial z} \)$, and higher-order derivatives.
 
 ##### `ray_tracing.py`
 - Implements the ray equations and their numerical solution using RK2.
