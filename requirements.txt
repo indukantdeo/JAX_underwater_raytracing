@@ -4,3 +4,4 @@ jax
 jaxlib
 jupyter
 tqdm
+ipykernel
