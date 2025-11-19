@@ -4,13 +4,18 @@ import jax.numpy as jnp
 import jax
 import sys
 import os
+
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 sys.path.append('src')
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),'simulation')))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),'simulation')))
+
 from boundary import bathymetry as bty, altimetry as ati
 from sound_speed import c
+
+# Specify the color to match Bellhop
 earthbrown = (0.5, 0.3, 0.1)
+
 def plot_environment(R_max, r_src, z_src, fig=None, ax=None, plot_src=True,
                      x_lim=None, y_lim=None, bty=bty, ati=ati,
                      plot_bty=True, fill_bty=True, plot_ati=True,
