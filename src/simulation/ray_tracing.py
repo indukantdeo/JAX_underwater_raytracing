@@ -67,12 +67,34 @@ class RK2_stepper:
         K = Y + (dt_tilde / 2.0) * self.function(Y)
         Y_new = Y + dt_tilde * self.function(K)
         
+        # eps = 1e-6
+        # Y_new = Y_new.at[1].set(jnp.minimum(Y_new[1], self.bty(Y_new[0]) - eps))
+        
         alpha = jnp.arctan(jax.grad(self.bty)(Y_new[0]))
         theta = jnp.arctan(Y_new[3] / Y_new[2])
         theta_new = -theta + 2 * alpha
         C_new = c(Y_new[0], Y_new[1])
         Y_new = Y_new.at[2].set(jnp.cos(theta_new) / C_new)
         Y_new = Y_new.at[3].set(jnp.sin(theta_new) / C_new)
+        
+        # # --- Ray-based (vector) specular reflection about boundary normal ---
+        # C_new = c(Y_new[0], Y_new[1])
+
+        # # Incident unit tangent vector (cosθ, sinθ) = c * (rho, zeta)
+        # t_inc = C_new * jnp.array([Y_new[2], Y_new[3]])
+
+        # # Boundary unit normal at reflection point
+        # n = self.n_bty(Y_new[0])
+
+        # # Reflect: t_ref = t_inc - 2*(t_inc·n)*n
+        # t_ref = t_inc - 2.0 * jnp.dot(t_inc, n) * n
+        
+        # # Safety: ensure reflected ray points into the water
+        # t_ref = jnp.where(jnp.dot(t_ref, n) > 0.0, t_ref, -t_ref)
+        
+        # # Convert back to slowness components
+        # Y_new = Y_new.at[2].set(t_ref[0] / C_new)
+        # Y_new = Y_new.at[3].set(t_ref[1] / C_new)
 
         return Y_new
 
@@ -96,6 +118,17 @@ class RK2_stepper:
         C_new = c(Y_new[0], Y_new[1])
         Y_new = Y_new.at[2].set(jnp.cos(theta_new) / C_new)
         Y_new = Y_new.at[3].set(jnp.sin(theta_new) / C_new)
+        
+        # # --- Ray-based (vector) specular reflection about boundary normal ---
+        # C_new = c(Y_new[0], Y_new[1])
+
+        # t_inc = C_new * jnp.array([Y_new[2], Y_new[3]])
+        # n = self.n_ati(Y_new[0])
+
+        # t_ref = t_inc - 2.0 * jnp.dot(t_inc, n) * n
+
+        # Y_new = Y_new.at[2].set(t_ref[0] / C_new)
+        # Y_new = Y_new.at[3].set(t_ref[1] / C_new)
         
         return Y_new
 

@@ -91,31 +91,78 @@ class RK2_stepper:
         K = Y + (dt_tilde / 2.0) * self.function(Y)
         Y_new = Y + dt_tilde * self.function(K)
         
-        alpha = jnp.arctan(jax.grad(self.bty)(Y_new[0]))
-        theta = jnp.arctan(Y_new[3] / Y_new[2])
-        theta_new = -theta + 2 * alpha
-        C_new = c(Y_new[0], Y_new[1])
-        Y_new = Y_new.at[2].set(jnp.cos(theta_new) / C_new)
-        Y_new = Y_new.at[3].set(jnp.sin(theta_new) / C_new)
+        # alpha = jnp.arctan(jax.grad(self.bty)(Y_new[0]))
+        # theta = jnp.arctan(Y_new[3] / Y_new[2])
+        # theta_new = -theta + 2 * alpha
+        # C_new = c(Y_new[0], Y_new[1])
+        # Y_new = Y_new.at[2].set(jnp.cos(theta_new) / C_new)
+        # Y_new = Y_new.at[3].set(jnp.sin(theta_new) / C_new)
         
-        # dynamic ray equations update
-        t_ray_new = jnp.array([Y_new[2], Y_new[3]])
-        n_bdry_new = self.n_bty(Y_new[0])
-        t_bdry_new = jnp.array([Y_new[0], self.bty(Y_new[0])])
-        Alpha = jnp.dot(t_ray_new, n_bdry_new)
-        Beta = jnp.dot(t_ray_new, t_bdry_new)
-        M = Beta / Alpha
-        rho_new = Y_new[2]
-        zeta_new = Y_new[3]
+        # # dynamic ray equations update
+        # t_ray_new = jnp.array([Y_new[2], Y_new[3]])
+        # n_bdry_new = self.n_bty(Y_new[0])
+        # t_bdry_new = jnp.array([Y_new[0], self.bty(Y_new[0])])
+        # Alpha = jnp.dot(t_ray_new, n_bdry_new)
+        # Beta = jnp.dot(t_ray_new, t_bdry_new)
+        # M = Beta / Alpha
+        # rho_new = Y_new[2]
+        # zeta_new = Y_new[3]
+        # cr_new = c_r(Y_new[0], Y_new[1])
+        # cz_new = c_z(Y_new[0], Y_new[1])
+        # cn = -1*C_new*(cr_new * zeta_new - cz_new * rho_new)
+        # cs = C_new*(cr_new * rho_new + cz_new * zeta_new)
+        # N = M*(4*cn -2*M*cs)/C_new**2
+        # # set p = p +q*N
+        # Y_new = Y_new.at[6].set(Y_new[6] + Y_new[4] * N)
+        # Y_new = Y_new.at[7].set(Y_new[7] + Y_new[5] * N)
+        # return Y_new
+        
+        # --- Specular reflection: vector form (chapter-faithful) ---
+        C_new = c(Y_new[0], Y_new[1])
+
+        # Incident unit tangent (dr/ds, dz/ds) = c * (rho, zeta)
+        tI = C_new * jnp.array([Y_new[2], Y_new[3]])
+        rhoI  = tI[0] / C_new
+        zetaI = tI[1] / C_new
+
+        # Boundary unit normal / tangent at hit point
+        n = self.n_bty(Y_new[0])          # should be unit
+        tB = self.t_bty(Y_new[0])         # MUST be unit tangent (see note below)
+
+        # Reflect ray direction: tR = tI - 2 (tI·n) n
+        tR = tI - 2.0 * jnp.dot(tI, n) * n
+
+        # Convert back to slowness components
+        Y_new = Y_new.at[2].set(tR[0] / C_new)
+        Y_new = Y_new.at[3].set(tR[1] / C_new)
+
+        # --- Dynamic reflection update (uses correct α,β decomposition) ---
+        # α = component along boundary normal, β = component along boundary tangent
+        # Use incident direction for α,β (this is standard in the reflection jump)
+        alpha = jnp.dot(tI / (jnp.linalg.norm(tI) + 1e-12), n)
+        beta  = jnp.dot(tI / (jnp.linalg.norm(tI) + 1e-12), tB)
+        M = beta / (alpha + 1e-12)
+
+        # Sound-speed gradients at the hit point
         cr_new = c_r(Y_new[0], Y_new[1])
         cz_new = c_z(Y_new[0], Y_new[1])
-        cn = -1*C_new*(cr_new * zeta_new - cz_new * rho_new)
-        cs = C_new*(cr_new * rho_new + cz_new * zeta_new)
-        N = M*(4*cn -2*M*cs)/C_new**2
-        # set p = p +q*N
+
+        # Keep your original cn/cs definitions (but now reflection geometry is correct)
+        # rho_new  = Y_new[2]
+        # zeta_new = Y_new[3]
+        rho_new  = rhoI
+        zeta_new = zetaI
+        cn = -1.0 * C_new * (cr_new * zeta_new - cz_new * rho_new)
+        cs =  1.0 * C_new * (cr_new * rho_new + cz_new * zeta_new)
+
+        N = M * (4.0 * cn - 2.0 * M * cs) / (C_new**2)
+
+        # p = p + q*N  (your state: q_r,q_i at [4],[5]; p_r,p_i at [6],[7])
         Y_new = Y_new.at[6].set(Y_new[6] + Y_new[4] * N)
         Y_new = Y_new.at[7].set(Y_new[7] + Y_new[5] * N)
+
         return Y_new
+
 
     def top_reflection(self, Y, Y_new):
         # Reflection handling for top (altimetry).
@@ -131,31 +178,69 @@ class RK2_stepper:
         K = Y + (dt_tilde / 2.0) * self.function(Y)
         Y_new = Y + dt_tilde * self.function(K)
         
-        alpha = jnp.arctan(jax.grad(self.ati)(Y_new[0]))
-        theta = jnp.arctan(Y_new[3] / Y_new[2])
-        theta_new = -theta - 2 * alpha
-        C_new = c(Y_new[0], Y_new[1])
-        Y_new = Y_new.at[2].set(jnp.cos(theta_new) / C_new)
-        Y_new = Y_new.at[3].set(jnp.sin(theta_new) / C_new)
+        # alpha = jnp.arctan(jax.grad(self.ati)(Y_new[0]))
+        # theta = jnp.arctan(Y_new[3] / Y_new[2])
+        # theta_new = -theta - 2 * alpha
+        # C_new = c(Y_new[0], Y_new[1])
+        # Y_new = Y_new.at[2].set(jnp.cos(theta_new) / C_new)
+        # Y_new = Y_new.at[3].set(jnp.sin(theta_new) / C_new)
         
-        # dynamic ray equations update
-        t_ray_new = jnp.array([Y_new[2], Y_new[3]])
-        n_bdry_new = self.n_bty(Y_new[0])
-        t_bdry_new = jnp.array([Y_new[0], self.bty(Y_new[0])])
-        Alpha = jnp.dot(t_ray_new, n_bdry_new)
-        Beta = jnp.dot(t_ray_new, t_bdry_new)
-        M = Beta / Alpha
-        rho_new = Y_new[2]
-        zeta_new = Y_new[3]
+        # # dynamic ray equations update
+        # t_ray_new = jnp.array([Y_new[2], Y_new[3]])
+        # n_bdry_new = self.n_bty(Y_new[0])
+        # t_bdry_new = jnp.array([Y_new[0], self.bty(Y_new[0])])
+        # Alpha = jnp.dot(t_ray_new, n_bdry_new)
+        # Beta = jnp.dot(t_ray_new, t_bdry_new)
+        # M = Beta / Alpha
+        # rho_new = Y_new[2]
+        # zeta_new = Y_new[3]
+        # cr_new = c_r(Y_new[0], Y_new[1])
+        # cz_new = c_z(Y_new[0], Y_new[1])
+        # cn = -1*C_new*(cr_new * zeta_new - cz_new * rho_new)
+        # cs = C_new*(cr_new * rho_new + cz_new * zeta_new)
+        # N = M*(4*cn -2*M*cs)/C_new**2
+        # # set p = p +q*N
+        # Y_new = Y_new.at[6].set(Y_new[6] + Y_new[4] * N)
+        # Y_new = Y_new.at[7].set(Y_new[7] + Y_new[5] * N)
+        
+        # return Y_new
+
+        # --- Specular reflection: vector form (chapter-faithful) ---
+        C_new = c(Y_new[0], Y_new[1])
+
+        tI = C_new * jnp.array([Y_new[2], Y_new[3]])
+        rhoI  = tI[0] / C_new
+        zetaI = tI[1] / C_new
+
+        # IMPORTANT: use TOP boundary normal/tangent (not bottom)
+        n = self.n_ati(Y_new[0])
+        tB = self.t_ati(Y_new[0])
+
+        tR = tI - 2.0 * jnp.dot(tI, n) * n
+
+        Y_new = Y_new.at[2].set(tR[0] / C_new)
+        Y_new = Y_new.at[3].set(tR[1] / C_new)
+
+        # --- Dynamic reflection update (correct α,β decomposition w.r.t TOP boundary) ---
+        alpha = jnp.dot(tI / (jnp.linalg.norm(tI) + 1e-12), n)
+        beta  = jnp.dot(tI / (jnp.linalg.norm(tI) + 1e-12), tB)
+        M = beta / (alpha + 1e-12)
+
         cr_new = c_r(Y_new[0], Y_new[1])
         cz_new = c_z(Y_new[0], Y_new[1])
-        cn = -1*C_new*(cr_new * zeta_new - cz_new * rho_new)
-        cs = C_new*(cr_new * rho_new + cz_new * zeta_new)
-        N = M*(4*cn -2*M*cs)/C_new**2
-        # set p = p +q*N
+
+        # rho_new  = Y_new[2]
+        # zeta_new = Y_new[3]
+        rho_new  = rhoI
+        zeta_new = zetaI
+        cn = -1.0 * C_new * (cr_new * zeta_new - cz_new * rho_new)
+        cs =  1.0 * C_new * (cr_new * rho_new + cz_new * zeta_new)
+
+        N = M * (4.0 * cn - 2.0 * M * cs) / (C_new**2)
+
         Y_new = Y_new.at[6].set(Y_new[6] + Y_new[4] * N)
         Y_new = Y_new.at[7].set(Y_new[7] + Y_new[5] * N)
-        
+
         return Y_new
 
 
@@ -335,7 +420,12 @@ def InfluenceGeoGaussian(freq, single_trj, z_s, delta_alpha, rr_grid, rz_grid, R
     Nrr = rr_grid.shape[0]
     Nrz = rz_grid.shape[0]
     
-    ray_q = single_trj[:,4]
+    # ray_q = single_trj[:,4]
+    q_r = single_trj[:, 4]
+    q_i = single_trj[:, 5]
+    ray_q = q_r + 1j * q_i                 # complex q along ray
+    ray_q_re = jnp.real(ray_q)             # for sign checks only
+
     ray_x = jnp.real(single_trj[:, :2])
     ray_tau = jnp.real(single_trj[:, 8])
     ray_Rfa = jnp.ones(Nsteps, dtype=jnp.float64)  # Placeholder for ray_Rfa, if needed.
@@ -350,8 +440,11 @@ def InfluenceGeoGaussian(freq, single_trj, z_s, delta_alpha, rr_grid, rz_grid, R
         def flip(c):
             return 1j * c
         # print("dtype of is_:", is_.dtype)
-        crossed = ((ray_q[is_] <= 0) & (ray_q[is_-1] > 0)) | \
-                  ((ray_q[is_] >= 0) & (ray_q[is_-1] < 0))
+        # crossed = ((ray_q[is_] <= 0) & (ray_q[is_-1] > 0)) | \
+        #           ((ray_q[is_] >= 0) & (ray_q[is_-1] < 0))
+        
+        crossed = ((ray_q_re[is_] <= 0) & (ray_q_re[is_-1] > 0)) | \
+                  ((ray_q_re[is_] >= 0) & (ray_q_re[is_-1] < 0))
         caustic = jax.lax.cond(is_>0 & crossed, flip, lambda c: c, caustic)
 
         # --- bracket receiver ranges ---
@@ -394,10 +487,16 @@ def InfluenceGeoGaussian(freq, single_trj, z_s, delta_alpha, rr_grid, rz_grid, R
                 s = delta @ t_ray_scaled
                 n = jnp.abs(delta @ n_ray)
 
-                # interpolated q and radius sigma
-                q0 = ray_q[0]
-                q_i = ray_q[is_] + s * (ray_q[is_+1] - ray_q[is_])
-                sigma = jnp.abs(q_i / q0)
+                # # interpolated q and radius sigma
+                # q0 = ray_q[0]
+                # q_i = ray_q[is_] + s * (ray_q[is_+1] - ray_q[is_])
+                # sigma = jnp.abs(q_i / q0)
+                # sigma_lim = jnp.minimum(0.2 * freq * ray_tau[is_] / lambda_, jnp.pi * lambda_)
+                # sigma = jnp.where(sigma < sigma_lim, sigma_lim, sigma)
+                
+                # interpolated complex q and beam radius sigma
+                q_seg = ray_q[is_] + s * (ray_q[is_+1] - ray_q[is_])   # complex
+                sigma = jnp.abs(q_seg) / (q0 + 1e-12)                 # q0 from line 331 (scalar)
                 sigma_lim = jnp.minimum(0.2 * freq * ray_tau[is_] / lambda_, jnp.pi * lambda_)
                 sigma = jnp.where(sigma < sigma_lim, sigma_lim, sigma)
 
@@ -409,18 +508,26 @@ def InfluenceGeoGaussian(freq, single_trj, z_s, delta_alpha, rr_grid, rz_grid, R
                     return Uc
 
                 def contrib(Uc):
-                    A = jnp.abs(q0 / q_i[irz])
+                    # A = jnp.abs(q0 / q_i[irz])
+                    A = jnp.abs(q0 / (q_seg[irz] + 1e-12))
                     delay = ray_tau[is_] + s[irz] * (ray_tau[is_+1] - ray_tau[is_])
 
                     # caustic phase per sub‐beam
                     caust = caustic_loc * jnp.ones_like(irz, dtype=jnp.complex64)
-                    flip_sub = ((q_i[irz] <= 0) & (ray_q[is_] > 0)) | \
-                               ((q_i[irz] >= 0) & (ray_q[is_] < 0))
+                    # flip_sub = ((q_i[irz] <= 0) & (ray_q[is_] > 0)) | \
+                    #            ((q_i[irz] >= 0) & (ray_q[is_] < 0))
+                    
+                    q_seg_re = jnp.real(q_seg)
+                    flip_sub = ((q_seg_re[irz] <= 0) & (ray_q_re[is_] > 0)) | \
+                            ((q_seg_re[irz] >= 0) & (ray_q_re[is_] < 0))
+                            
                     caust = jnp.where(flip_sub, 1j * caust, caust)
 
-                    const = (Rat1 * ray_Rfa[is_] *
-                             jnp.sqrt(c(ray_x[is_, 0], ray_x[is_, 1]) / jnp.abs(q_i[irz])) *
-                             caust)
+                    # const = (Rat1 * ray_Rfa[is_] *
+                            #  jnp.sqrt(c(ray_x[is_, 0], ray_x[is_, 1]) / jnp.abs(q_i[irz])) *
+                            #  caust)
+                            
+                    const = (Rat1 * ray_Rfa[is_] *jnp.sqrt(c(ray_x[is_, 0], ray_x[is_, 1]) / (jnp.abs(q_seg[irz]) + 1e-12)) *caust)
 
                     if RunTypeE == 'S':
                         const = DS * const

@@ -20,7 +20,8 @@ def tangent_vector_to_bathymetry(r):
     Returns the unit tangent vector to the bathymetry at range r.
     """
     dz_dr = jax.grad(bathymetry)(r)
-    tangent_vector = jnp.array([-1, dz_dr], dtype=jnp.float64)
+    # tangent_vector = jnp.array([-1, dz_dr], dtype=jnp.float64)
+    tangent_vector = jnp.array([1.0, dz_dr], dtype=jnp.float64)
     tangent_vector /= jnp.linalg.norm(tangent_vector)
     return tangent_vector
 
@@ -30,12 +31,23 @@ def normal_vector_to_bathymetry(r):
     Returns the unit normal vector to the bathymetry at range r.
     """
     tangent_vector = tangent_vector_to_bathymetry(r)
-    normal_vector = jnp.array([-tangent_vector[1], tangent_vector[0]], dtype=jnp.float64)
+    normal_vector = jnp.array([tangent_vector[1], -tangent_vector[0]], dtype=jnp.float64)
     normal_vector /= jnp.linalg.norm(normal_vector)
     
-    
+    # Enforce bottom normal points into the water: upward => n_z < 0 (since z is down)
+    # normal_vector = jnp.where(normal_vector[1] < 0.0, normal_vector, -normal_vector)
     
     return normal_vector
+    # t = tangent_vector_to_bathymetry(r)
+    # n = jnp.array([-t[1], t[0]])
+    # n = n / jnp.linalg.norm(n)
+
+    # # Enforce bottom normal points into the water.
+    # # Depth z is positive downward, so "into water" is upward => n_z < 0.
+    # n = jnp.where(n[1] < 0.0, n, -n)
+    # return n
+    
+    
 
 @jax.jit
 def altimetry(r):
