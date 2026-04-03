@@ -7,7 +7,7 @@ This directory defines a reproducible validation workflow for comparing the repo
 
 ## Scope
 
-The goal is to support journal-level validation artifacts for:
+The goal is to support validation artifacts for:
 
 - full TL field comparisons
 - TL-vs-range slices at fixed receiver depths
@@ -94,9 +94,9 @@ For the full TL field and each requested TL-vs-range slice:
 
 The report also includes solver runtime for the JAX solve.
 
-## Journal-level validation guidance
+## Validation guidance
 
-For publication-quality validation, the minimum standard should be:
+For validation, the minimum standard should be:
 
 - compare the full TL shade field against Bellhop on identical grids
 - compare multiple TL-vs-range slices, not just one receiver depth
@@ -107,6 +107,4 @@ For publication-quality validation, the minimum standard should be:
 
 ## Current limitations
 
-- This repository does not yet contain Bellhop-generated reference fields.
-- The local environment used by Codex did not have `jax` installed, so runtime validation was not executed here.
 - Boundary loss models and full Bellhop-equivalent field accumulation are still incomplete, so discrepancies are expected even after the benchmark pipeline is populated with Bellhop outputs.
