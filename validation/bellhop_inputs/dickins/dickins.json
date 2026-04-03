@@ -1,0 +1,22 @@
+{
+  "name": "dickins",
+  "title": "Bellhop/JAX validation: Dickins seamount",
+  "frequency_hz": 230.0,
+  "source_range_m": 0.0,
+  "source_depth_m": 18.0,
+  "theta_min_deg": -45.0,
+  "theta_max_deg": 45.0,
+  "n_beams": 181,
+  "ds_m": 5.0,
+  "max_range_m": 100000.0,
+  "max_depth_m": 3000.0,
+  "n_range": 1001,
+  "n_depth": 601,
+  "tl_slice_depths_m": [
+    18.0,
+    250.0,
+    1000.0
+  ],
+  "sound_speed_profile": "default",
+  "bathymetry_profile": "dickins"
+}

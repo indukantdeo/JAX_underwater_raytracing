@@ -84,6 +84,12 @@ An implementation audit describing what is currently available and what is still
 
 - `docs/bellhop_solver_audit.md`
 
+## Validation
+
+A dedicated Bellhop-vs-JAX validation and benchmarking workflow is provided in:
+
+- `validation/README.md`
+
 ---
 
 ## Citing This Work

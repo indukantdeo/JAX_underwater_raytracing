@@ -3,6 +3,12 @@ import jax
 import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
+
+@jax.jit
+def flat_bathymetry(r):
+    return 5000.0 + 0.0 * r
+
+
 @jax.jit
 def bathymetry(r):
     """
@@ -57,6 +63,48 @@ def altimetry(r):
     a0 = 0.0
     return a0
 
+
+def make_boundary_operators(bathymetry_fn, altimetry_fn):
+    bathymetry_eval = jax.jit(bathymetry_fn)
+    altimetry_eval = jax.jit(altimetry_fn)
+
+    @jax.jit
+    def tangent_vector_to_bathymetry_eval(r):
+        dz_dr = jax.grad(bathymetry_eval)(r)
+        tangent_vector = jnp.array([1.0, dz_dr], dtype=jnp.float64)
+        tangent_vector /= jnp.linalg.norm(tangent_vector)
+        return tangent_vector
+
+    @jax.jit
+    def normal_vector_to_bathymetry_eval(r):
+        tangent_vector = tangent_vector_to_bathymetry_eval(r)
+        normal_vector = jnp.array([tangent_vector[1], -tangent_vector[0]], dtype=jnp.float64)
+        normal_vector /= jnp.linalg.norm(normal_vector)
+        return normal_vector
+
+    @jax.jit
+    def tangent_vector_to_altimetry_eval(r):
+        dz_dr = jax.grad(altimetry_eval)(r)
+        tangent_vector = jnp.array([1.0, dz_dr], dtype=jnp.float64)
+        tangent_vector /= jnp.linalg.norm(tangent_vector)
+        return tangent_vector
+
+    @jax.jit
+    def normal_vector_to_altimetry_eval(r):
+        tangent_vector = tangent_vector_to_altimetry_eval(r)
+        normal_vector = jnp.array([-tangent_vector[1], tangent_vector[0]], dtype=jnp.float64)
+        normal_vector /= jnp.linalg.norm(normal_vector)
+        return normal_vector
+
+    return {
+        "bathymetry": bathymetry_eval,
+        "altimetry": altimetry_eval,
+        "tangent_vector_to_bathymetry": tangent_vector_to_bathymetry_eval,
+        "normal_vector_to_bathymetry": normal_vector_to_bathymetry_eval,
+        "tangent_vector_to_altimetry": tangent_vector_to_altimetry_eval,
+        "normal_vector_to_altimetry": normal_vector_to_altimetry_eval,
+    }
+
 @jax.jit
 def tangent_vector_to_altimetry(r):
     """
@@ -76,3 +124,7 @@ def normal_vector_to_altimetry(r):
     normal_vector = jnp.array([-tangent_vector[1], tangent_vector[0]], dtype=jnp.float64)
     normal_vector /= jnp.linalg.norm(normal_vector)
     return normal_vector
+
+
+DEFAULT_BOUNDARY_OPERATORS = make_boundary_operators(bathymetry, altimetry)
+FLAT_BOUNDARY_OPERATORS = make_boundary_operators(flat_bathymetry, altimetry)

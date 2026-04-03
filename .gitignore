@@ -1,2 +1,6 @@
 ./JAX_underwater_raytracing/
 /JAX_underwater_raytracing/
+__pycache__/
+*.pyc
+validation/results/*
+!validation/results/.gitkeep

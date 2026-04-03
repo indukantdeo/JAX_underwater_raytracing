@@ -10,9 +10,30 @@ sys.path.append('./')
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 # Import functions from other modules.
-from sound_speed import c, c_r, c_z
-from boundary import bathymetry as bty, altimetry as ati, normal_vector_to_bathymetry as n_bty, normal_vector_to_altimetry as n_ati
+from sound_speed import c, c_r, c_z, DEFAULT_OPERATORS
+from boundary import (
+    bathymetry as bty,
+    altimetry as ati,
+    normal_vector_to_bathymetry as n_bty,
+    normal_vector_to_altimetry as n_ati,
+    DEFAULT_BOUNDARY_OPERATORS,
+)
 from plot import plot_environment, plot_ray_paths
+
+
+def configure_acoustic_operators(sound_speed_operators=None, boundary_operators=None):
+    global c, c_r, c_z, bty, ati, n_bty, n_ati
+
+    ssp = DEFAULT_OPERATORS if sound_speed_operators is None else sound_speed_operators
+    bdry = DEFAULT_BOUNDARY_OPERATORS if boundary_operators is None else boundary_operators
+
+    c = ssp["c"]
+    c_r = ssp["c_r"]
+    c_z = ssp["c_z"]
+    bty = bdry["bathymetry"]
+    ati = bdry["altimetry"]
+    n_bty = bdry["normal_vector_to_bathymetry"]
+    n_ati = bdry["normal_vector_to_altimetry"]
 
 @jax.jit
 def ray_eqns(Y):
@@ -45,13 +66,13 @@ def ray_eqns(Y):
 
 # Modified RK2 stepper with reflection counting.
 class RK2_stepper:
-    def __init__(self, function, dt, ati=ati, bty=bty, n_ati=n_ati, n_bty=n_bty):
+    def __init__(self, function, dt, ati=None, bty=None, n_ati=None, n_bty=None):
         self.function = function  # Expecting extended_ray_eqns.
         self.dt = dt
-        self.ati = ati
-        self.bty = bty
-        self.n_bty = n_bty
-        self.n_ati = n_ati
+        self.ati = ati if ati is not None else globals()["ati"]
+        self.bty = bty if bty is not None else globals()["bty"]
+        self.n_bty = n_bty if n_bty is not None else globals()["n_bty"]
+        self.n_ati = n_ati if n_ati is not None else globals()["n_ati"]
 
     def bottom_reflection(self, Y, Y_new):
         # Reflection handling for bottom (bathymetry).
@@ -204,7 +225,7 @@ def compute_single_ray_path(r_s, z_s, theta_0, ray_eqns=ray_eqns, ds=10.0, R_max
     trj = rollout(stepper, num_steps, include_init=True)(Y0)
     return trj
 
-def compute_multiple_ray_paths(r_s, z_s, theta, ray_eqns=ray_eqns, ds=10.0, R_max=100000, Z_max=5000, ati=ati, bty=bty):
+def compute_multiple_ray_paths(r_s, z_s, theta, ray_eqns=ray_eqns, ds=10.0, R_max=100000, Z_max=5000, ati=None, bty=None):
     """
     Computes trajectories for an array of initial angles using vectorized integration.
     """
@@ -259,4 +280,3 @@ def write_ray_file(filename, ray_summary):
     # Write the entire output to file in one go.
     with open(filename, "w") as f:
         f.write(out.getvalue())
-

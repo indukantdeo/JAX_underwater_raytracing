@@ -11,11 +11,34 @@ sys.path.append('./')
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 # Import functions from other modules.
-from sound_speed import c, c_r, c_z, c_rr, c_zz, c_rz
+from sound_speed import c, c_r, c_z, c_rr, c_zz, c_rz, DEFAULT_OPERATORS
 from boundary import (
     bathymetry as bty, altimetry as ati, normal_vector_to_altimetry, normal_vector_to_bathymetry as n_bty,
-    normal_vector_to_altimetry as n_ati, tangent_vector_to_altimetry as t_ati, tangent_vector_to_bathymetry as t_bty
+    normal_vector_to_altimetry as n_ati, tangent_vector_to_altimetry as t_ati, tangent_vector_to_bathymetry as t_bty,
+    DEFAULT_BOUNDARY_OPERATORS,
 )
+
+
+def configure_acoustic_operators(sound_speed_operators=None, boundary_operators=None):
+    global c, c_r, c_z, c_rr, c_zz, c_rz
+    global bty, ati, n_bty, n_ati, t_ati, t_bty
+
+    ssp = DEFAULT_OPERATORS if sound_speed_operators is None else sound_speed_operators
+    bdry = DEFAULT_BOUNDARY_OPERATORS if boundary_operators is None else boundary_operators
+
+    c = ssp["c"]
+    c_r = ssp["c_r"]
+    c_z = ssp["c_z"]
+    c_rr = ssp["c_rr"]
+    c_rz = ssp["c_rz"]
+    c_zz = ssp["c_zz"]
+
+    bty = bdry["bathymetry"]
+    ati = bdry["altimetry"]
+    n_bty = bdry["normal_vector_to_bathymetry"]
+    n_ati = bdry["normal_vector_to_altimetry"]
+    t_bty = bdry["tangent_vector_to_bathymetry"]
+    t_ati = bdry["tangent_vector_to_altimetry"]
 
 
 
@@ -67,15 +90,15 @@ def dynamic_ray_eqns(Y):
 
 # Modified RK2 stepper with reflection counting.
 class RK2_stepper:
-    def __init__(self, function, dt, ati=ati, bty=bty, t_ati=t_ati, n_ati=n_ati, t_bty=t_bty, n_bty=n_bty):
+    def __init__(self, function, dt, ati=None, bty=None, t_ati=None, n_ati=None, t_bty=None, n_bty=None):
         self.function = function  # Expecting extended_ray_eqns.
         self.dt = dt
-        self.ati = ati
-        self.bty = bty
-        self.n_bty = n_bty
-        self.t_bty = t_bty
-        self.t_ati = t_ati
-        self.n_ati = n_ati
+        self.ati = ati if ati is not None else globals()["ati"]
+        self.bty = bty if bty is not None else globals()["bty"]
+        self.n_bty = n_bty if n_bty is not None else globals()["n_bty"]
+        self.t_bty = t_bty if t_bty is not None else globals()["t_bty"]
+        self.t_ati = t_ati if t_ati is not None else globals()["t_ati"]
+        self.n_ati = n_ati if n_ati is not None else globals()["n_ati"]
 
     def bottom_reflection(self, Y, Y_new):
         # Reflection handling for bottom (bathymetry).
@@ -332,8 +355,8 @@ def compute_multiple_ray_paths(
     ds=10.0,
     R_max=100000,
     Z_max=5000,
-    ati=ati,
-    bty=bty,
+    ati=None,
+    bty=None,
     beam_type='paraxial',
 ):
     """
