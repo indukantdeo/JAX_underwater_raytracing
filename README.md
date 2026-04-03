@@ -51,6 +51,13 @@ pip install -r requirements.txt
 - Includes a JAX-compatible `rollout` function for efficiently computing ray paths.
 - Handles reflection from top/bottom boundaries using `jax.lax.cond` to preserve AutoDiff compatibility.
 
+##### `dynamic_ray_tracing.py`
+- Implements dynamic ray tracing with `(q, p, tau)` state variables.
+- Provides Bellhop-style launch-fan and TL helpers:
+  - `trace_beam_fan(...)`
+  - `solve_transmission_loss(...)`
+- Includes a differentiable geometric Gaussian beam accumulator for 2D TL fields.
+
 ---
 
 ## Examples
@@ -66,9 +73,16 @@ python examples/example_1.py
 ---
 
 ## Future Features (Planned)
-- Gaussian beam tracing extension  
+- Bellhop parity for boundary losses / reflection coefficients
+- Validation against Bellhop benchmark cases
 - 3D ray tracing    
 - Interfacing with realistic oceanographic datasets (e.g., World Ocean Atlas)
+
+## Implementation Audit
+
+An implementation audit describing what is currently available and what is still missing for Bellhop parity is provided in:
+
+- `docs/bellhop_solver_audit.md`
 
 ---
 
