@@ -5,6 +5,12 @@ This directory defines a reproducible validation workflow for comparing the repo
 - `munk`: canonical deep-water Munk-profile validation
 - `dickins`: Dickins seamount range-dependent bathymetry case
 
+Related documentation:
+
+- `docs/solver_architecture.md`
+- `docs/api_usage_guide.md`
+- `src/running.md`
+
 ## Scope
 
 The goal is to support validation artifacts for:

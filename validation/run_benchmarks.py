@@ -64,6 +64,7 @@ def _configure_case(case, boundary_mod, dyn_mod, ssp_mod):
 
 
 def _run_solver(case, *, rr_grid=None, rz_grid=None, n_beams=None, auto_beam_count: bool | None = None):
+    """Run one benchmark case and return a NumPy-native result bundle for reporting."""
     jnp, boundary_mod, dyn_mod, ssp_mod = _load_runtime_modules()
     _configure_case(case, boundary_mod, dyn_mod, ssp_mod)
 
@@ -84,7 +85,7 @@ def _run_solver(case, *, rr_grid=None, rz_grid=None, n_beams=None, auto_beam_cou
         rz_grid,
         ds=case.ds_m,
         beam_type="geometric",
-        coherent=True,
+        run_mode="coherent",
         accumulation_model=case.beam_influence_model,
         auto_beam_count=auto_beam_count,
         source_beam_pattern_angles_deg=case.source_beam_pattern_angles_deg,

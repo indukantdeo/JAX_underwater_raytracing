@@ -2,6 +2,11 @@
 
 This document explains how to run the current solver code in this repository.
 
+For architecture and API-level documentation, also see:
+
+- `docs/solver_architecture.md`
+- `docs/api_usage_guide.md`
+
 There are now two main solver paths:
 
 - `solve_transmission_loss(...)`
@@ -68,7 +73,7 @@ result = solve_transmission_loss(
 )
 
 print(result["tl_db"].shape)
-print(result["run_mode"])
+print(result["field_total"].shape)
 PY
 ```
 
@@ -206,3 +211,4 @@ JAX_underwater_raytracing/bin/python validation/plot_dickins_ray_comparison.py \
 - The Bellhop-style path is the right path for fidelity studies against Bellhop.
 - The autodiff-safe path is the right path for SciML optimization and inverse problems.
 - The current validation runner uses `solve_transmission_loss(...)`, not the autodiff-safe path.
+- New code should prefer the explicit `run_mode` argument over the legacy `coherent` boolean.

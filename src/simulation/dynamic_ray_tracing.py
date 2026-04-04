@@ -1,10 +1,46 @@
+"""Differentiable 2D underwater acoustic ray and beam tracing in JAX.
+
+This module contains the main forward solvers used by the repository:
+
+- ``solve_transmission_loss(...)``:
+  Bellhop-oriented tracing and field accumulation path used for fidelity
+  studies and Bellhop/JAX validation.
+- ``solve_transmission_loss_autodiff(...)``:
+  autodiff-safe path for SciML workloads where smooth gradients are more
+  important than exact Bellhop feature parity.
+
+Design overview
+---------------
+The implementation is organized as a three-stage pipeline:
+
+1. Acoustic environment configuration
+   ``configure_acoustic_operators(...)`` installs sound-speed, bathymetry,
+   altimetry, and reflection operators used by the solver.
+2. Batched ray tracing
+   Rays are traced as a single batched state tensor using JAX-native control
+   flow and masking. This keeps the rollout GPU/TPU-friendly and avoids
+   Python loops over rays.
+3. Receiver-grid field accumulation
+   Traced beam states are mapped to a receiver grid to produce complex
+   pressure and transmission loss fields.
+
+Two solver modes are intentionally exposed because the repository serves two
+different engineering goals:
+
+- Bellhop compatibility for benchmarking and validation.
+- end-to-end differentiability for inverse problems and SciML training.
+"""
+
 import jax
 import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
+from jax import core as jax_core
 
 import sys
 import os
 import functools
+from dataclasses import asdict, dataclass, field
+from typing import Mapping, Literal
 
 sys.path.append('.')
 sys.path.append('./')
@@ -18,28 +54,57 @@ from boundary import (
     DEFAULT_BOUNDARY_OPERATORS,
 )
 
-DEFAULT_REFLECTION_MODEL = {
-    "source_type": "point",
-    "water_density_gcc": 1.0,
-    "top_boundary_condition": "vacuum",
-    "bottom_boundary_condition": "rigid",
-    "kill_backward_rays": False,
-    "bottom_alpha_r_mps": 1600.0,
-    "bottom_alpha_i_user": 0.0,
-    "bottom_beta_r_mps": 0.0,
-    "bottom_beta_i_user": 0.0,
-    "bottom_density_gcc": 1.8,
-    "attenuation_units": "W",
-}
+RunMode = Literal["coherent", "incoherent", "semicoherent"]
+AccumulationModel = Literal["bellhop", "gaussian", "hat"]
+BeamType = Literal["geometric"]
 
-DEFAULT_STEP_CONTROL = {
-    "ssp_interface_depths_m": jnp.asarray([], dtype=jnp.float64),
-    "bathymetry_range_breaks_m": jnp.asarray([], dtype=jnp.float64),
-    "altimetry_range_breaks_m": jnp.asarray([], dtype=jnp.float64),
-}
+
+@dataclass(frozen=True)
+class ReflectionModelConfig:
+    source_type: str = "point"
+    water_density_gcc: float = 1.0
+    top_boundary_condition: str = "vacuum"
+    bottom_boundary_condition: str = "rigid"
+    kill_backward_rays: bool = False
+    bottom_alpha_r_mps: float = 1600.0
+    bottom_alpha_i_user: float = 0.0
+    bottom_beta_r_mps: float = 0.0
+    bottom_beta_i_user: float = 0.0
+    bottom_density_gcc: float = 1.8
+    attenuation_units: str = "W"
+
+
+@dataclass(frozen=True)
+class StepControlConfig:
+    ssp_interface_depths_m: jnp.ndarray = field(default_factory=lambda: jnp.asarray([], dtype=jnp.float64))
+    bathymetry_range_breaks_m: jnp.ndarray = field(default_factory=lambda: jnp.asarray([], dtype=jnp.float64))
+    altimetry_range_breaks_m: jnp.ndarray = field(default_factory=lambda: jnp.asarray([], dtype=jnp.float64))
+
+
+DEFAULT_REFLECTION_MODEL = ReflectionModelConfig()
+DEFAULT_STEP_CONTROL = StepControlConfig()
+
+
+def _reflection_model_to_dict(reflection_model: ReflectionModelConfig | Mapping | None) -> dict:
+    if reflection_model is None:
+        return asdict(DEFAULT_REFLECTION_MODEL)
+    if isinstance(reflection_model, ReflectionModelConfig):
+        return asdict(reflection_model)
+    merged = asdict(DEFAULT_REFLECTION_MODEL)
+    merged.update(dict(reflection_model))
+    return merged
+
+
+def _step_control_from_operators(ssp_operators: Mapping, boundary_operators: Mapping) -> StepControlConfig:
+    return StepControlConfig(
+        ssp_interface_depths_m=jnp.asarray(ssp_operators.get("interface_depths_m", jnp.asarray([], dtype=jnp.float64))),
+        bathymetry_range_breaks_m=jnp.asarray(boundary_operators.get("bathymetry_range_breaks_m", jnp.asarray([], dtype=jnp.float64))),
+        altimetry_range_breaks_m=jnp.asarray(boundary_operators.get("altimetry_range_breaks_m", jnp.asarray([], dtype=jnp.float64))),
+    )
 
 
 def configure_acoustic_operators(sound_speed_operators=None, boundary_operators=None, reflection_model=None):
+    """Configure globally active acoustic operators for tracing and field solve."""
     global c, c_r, c_z, c_rr, c_zz, c_rz
     global bty, ati, n_bty, n_ati, t_ati, t_bty
     global REFLECTION_MODEL, STEP_CONTROL
@@ -60,18 +125,12 @@ def configure_acoustic_operators(sound_speed_operators=None, boundary_operators=
     n_ati = bdry["normal_vector_to_altimetry"]
     t_bty = bdry["tangent_vector_to_bathymetry"]
     t_ati = bdry["tangent_vector_to_altimetry"]
-    REFLECTION_MODEL = dict(DEFAULT_REFLECTION_MODEL)
-    if reflection_model is not None:
-        REFLECTION_MODEL.update(reflection_model)
-    STEP_CONTROL = {
-        "ssp_interface_depths_m": ssp.get("interface_depths_m", jnp.asarray([], dtype=jnp.float64)),
-        "bathymetry_range_breaks_m": bdry.get("bathymetry_range_breaks_m", jnp.asarray([], dtype=jnp.float64)),
-        "altimetry_range_breaks_m": bdry.get("altimetry_range_breaks_m", jnp.asarray([], dtype=jnp.float64)),
-    }
+    REFLECTION_MODEL = _reflection_model_to_dict(reflection_model)
+    STEP_CONTROL = asdict(_step_control_from_operators(ssp, bdry))
 
 
-REFLECTION_MODEL = dict(DEFAULT_REFLECTION_MODEL)
-STEP_CONTROL = dict(DEFAULT_STEP_CONTROL)
+REFLECTION_MODEL = asdict(DEFAULT_REFLECTION_MODEL)
+STEP_CONTROL = asdict(DEFAULT_STEP_CONTROL)
 
 
 def bellhop_recommended_nbeams(freq, c0, r_max, theta_min, theta_max):
@@ -742,6 +801,54 @@ def _resolve_run_mode(run_mode=None, coherent=None):
         return "coherent"
     return "coherent" if coherent else "incoherent"
 
+
+def _validate_solver_inputs(
+    freq,
+    theta_min,
+    theta_max,
+    n_beams,
+    rr_grid,
+    rz_grid,
+    ds,
+    accumulation_model,
+    beam_type,
+):
+    if not isinstance(freq, jax_core.Tracer) and float(freq) <= 0.0:
+        raise ValueError("freq must be positive.")
+    if int(n_beams) < 1:
+        raise ValueError("n_beams must be at least 1.")
+    if not isinstance(ds, jax_core.Tracer) and float(ds) <= 0.0:
+        raise ValueError("ds must be positive.")
+    if (
+        not isinstance(theta_min, jax_core.Tracer)
+        and not isinstance(theta_max, jax_core.Tracer)
+        and float(theta_max) <= float(theta_min)
+    ):
+        raise ValueError("theta_max must be greater than theta_min.")
+    if rr_grid.ndim != 1 or rz_grid.ndim != 1:
+        raise ValueError("rr_grid and rz_grid must be one-dimensional arrays.")
+    if rr_grid.shape[0] < 2 or rz_grid.shape[0] < 2:
+        raise ValueError("rr_grid and rz_grid must contain at least two points.")
+    if not jnp.all(rr_grid[1:] > rr_grid[:-1]):
+        raise ValueError("rr_grid must be strictly increasing.")
+    if not jnp.all(rz_grid[1:] > rz_grid[:-1]):
+        raise ValueError("rz_grid must be strictly increasing.")
+
+    valid_accumulation_models = {"bellhop", "gaussian", "hat"}
+    if accumulation_model not in valid_accumulation_models:
+        raise ValueError(
+            f"accumulation_model must be one of {sorted(valid_accumulation_models)}, got {accumulation_model!r}."
+        )
+    valid_beam_types = {"geometric"}
+    if beam_type not in valid_beam_types:
+        raise ValueError(f"beam_type must be one of {sorted(valid_beam_types)}, got {beam_type!r}.")
+
+
+def _resolve_propagation_limits(rr_grid, rz_grid, R_max, Z_max):
+    resolved_r_max = float(rr_grid[-1]) if R_max is None else float(R_max)
+    resolved_z_max = float(rz_grid[-1]) if Z_max is None else float(Z_max)
+    return resolved_r_max, resolved_z_max
+
 @functools.partial(jax.jit, static_argnames=('RunTypeE',))
 def InfluenceGeoGaussian(freq, single_trj, z_s, source_takeoff_angle, source_amplitude, delta_alpha, rr_grid, rz_grid, RunTypeE='S'):
     
@@ -1191,12 +1298,54 @@ def solve_transmission_loss(
     bty=bty,
 ):
     """
-    High-level differentiable 2D TL solve.
+    Solve a 2D transmission-loss field using the Bellhop-oriented path.
 
-    Returns a dictionary containing the launch angles, traced trajectories,
-    complex (or intensity-like) field, and TL in dB.
+    This entry point is intended for validation and Bellhop-comparison
+    workflows. It performs:
+
+    1. launch-fan construction
+    2. batched ray tracing
+    3. beam influence accumulation on the receiver grid
+    4. Bellhop-style pressure scaling and TL conversion
+
+    Parameters
+    ----------
+    freq, r_s, z_s:
+        Source frequency and position.
+    theta_min, theta_max, n_beams:
+        Launch-fan definition.
+    rr_grid, rz_grid:
+        Receiver range/depth grids. Both must be strictly increasing.
+    ds:
+        Arc-length step size.
+    beam_type:
+        Currently ``"geometric"``.
+    coherent, run_mode:
+        Legacy boolean and explicit run-mode interface. ``run_mode`` is
+        preferred and may be ``"coherent"``, ``"incoherent"``, or
+        ``"semicoherent"``.
+    accumulation_model:
+        ``"bellhop"``, ``"gaussian"``, or ``"hat"``.
+
+    Returns
+    -------
+    dict
+        Dictionary containing launch angles, trajectories, complex field
+        arrays, and TL in dB.
     """
     run_mode = _resolve_run_mode(run_mode, coherent)
+    _validate_solver_inputs(
+        freq,
+        theta_min,
+        theta_max,
+        n_beams,
+        rr_grid,
+        rz_grid,
+        ds,
+        accumulation_model,
+        beam_type,
+    )
+    R_max, Z_max = _resolve_propagation_limits(rr_grid, rz_grid, R_max, Z_max)
 
     theta, launch_weights, source_amplitudes, trj_set = trace_beam_fan(
         freq,
@@ -1206,8 +1355,8 @@ def solve_transmission_loss(
         theta_max,
         n_beams,
         ds=ds,
-        R_max=float(rr_grid[-1]) if R_max is None else R_max,
-        Z_max=float(rz_grid[-1]) if Z_max is None else Z_max,
+        R_max=R_max,
+        Z_max=Z_max,
         beam_type=beam_type,
         auto_beam_count=auto_beam_count,
         source_beam_pattern_angles_deg=source_beam_pattern_angles_deg,
@@ -1410,13 +1559,33 @@ def solve_transmission_loss_autodiff(
     bty=bty,
 ):
     """
-    Autodiff-safe Gaussian-beam TL solver for SciML workflows.
+    Solve a 2D transmission-loss field with an autodiff-safe accumulation path.
 
     This path avoids discrete receiver bracketing and hard receiver masks by
     using smooth segment windows and full-grid Gaussian influence evaluation.
     It is intended for gradient-based inversion/training workloads.
+
+    Compared with ``solve_transmission_loss(...)``, this routine prioritizes:
+
+    - stable reverse-mode differentiation
+    - JIT/vmap friendliness
+    - smooth receiver-grid accumulation
+
+    over exact Bellhop feature parity.
     """
     run_mode = _resolve_run_mode(run_mode, None)
+    _validate_solver_inputs(
+        freq,
+        theta_min,
+        theta_max,
+        n_beams,
+        rr_grid,
+        rz_grid,
+        ds,
+        "bellhop",
+        beam_type,
+    )
+    R_max, Z_max = _resolve_propagation_limits(rr_grid, rz_grid, R_max, Z_max)
     theta, launch_weights, source_amplitudes, trj_set = trace_beam_fan(
         freq,
         r_s,
@@ -1425,8 +1594,8 @@ def solve_transmission_loss_autodiff(
         theta_max,
         n_beams,
         ds=ds,
-        R_max=float(rr_grid[-1]) if R_max is None else R_max,
-        Z_max=float(rz_grid[-1]) if Z_max is None else Z_max,
+        R_max=R_max,
+        Z_max=Z_max,
         beam_type=beam_type,
         auto_beam_count=auto_beam_count,
         source_beam_pattern_angles_deg=source_beam_pattern_angles_deg,
