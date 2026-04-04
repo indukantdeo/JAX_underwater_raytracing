@@ -138,6 +138,147 @@ Outputs:
 - TL-vs-range slice plots
 - JSON and Markdown reports
 
+## Example: Run The DickinsB Case In The JAX Solver
+
+`DickinsB.env` is the Bellhop reference case. In this repository, the matching JAX-side benchmark case is `dickins` in `validation/cases.py`.
+
+The simplest way to run the JAX version of the DickinsB case is through the validation runner:
+
+```bash
+export JAX_PLATFORMS=cpu
+export MPLCONFIGDIR=/tmp/matplotlib-jax-underwater
+mkdir -p "$MPLCONFIGDIR"
+
+JAX_underwater_raytracing/bin/python validation/run_benchmarks.py --case dickins
+```
+
+This will:
+
+- configure the Dickins seamount bathymetry
+- configure the default repository SSP used for the Dickins benchmark
+- run the coherent JAX TL solve
+- save TL fields, slice plots, and comparison artifacts under `validation/results/dickins/`
+
+If you want Bellhop-style beam-density selection instead of the fixed benchmark beam count:
+
+```bash
+JAX_underwater_raytracing/bin/python validation/run_benchmarks.py --case dickins --auto-beam-count
+```
+
+If you want to run the Dickins case directly from Python without the benchmark harness:
+
+```python
+import jax.numpy as jnp
+from validation.cases import DICKINS_CASE
+from src.simulation import boundary as boundary_mod
+from src.simulation import dynamic_ray_tracing as dyn_mod
+from src.simulation import sound_speed as ssp_mod
+
+dyn_mod.configure_acoustic_operators(
+    sound_speed_operators=ssp_mod.DEFAULT_OPERATORS,
+    boundary_operators=boundary_mod.DEFAULT_BOUNDARY_OPERATORS,
+    reflection_model={
+        "source_type": "point",
+        "top_boundary_condition": DICKINS_CASE.top_boundary_condition,
+        "bottom_boundary_condition": DICKINS_CASE.bottom_boundary_condition,
+        "kill_backward_rays": DICKINS_CASE.kill_backward_rays,
+        "bottom_alpha_r_mps": DICKINS_CASE.bottom_alpha_r_mps,
+        "bottom_alpha_i_user": DICKINS_CASE.bottom_alpha_i_user,
+        "bottom_beta_r_mps": DICKINS_CASE.bottom_beta_r_mps,
+        "bottom_beta_i_user": DICKINS_CASE.bottom_beta_i_user,
+        "bottom_density_gcc": DICKINS_CASE.bottom_density_gcc,
+        "attenuation_units": DICKINS_CASE.attenuation_units,
+    },
+)
+
+rr_grid = jnp.asarray(DICKINS_CASE.rr_grid)
+rz_grid = jnp.asarray(DICKINS_CASE.rz_grid)
+
+result = dyn_mod.solve_transmission_loss(
+    freq=DICKINS_CASE.frequency_hz,
+    r_s=DICKINS_CASE.source_range_m,
+    z_s=DICKINS_CASE.source_depth_m,
+    theta_min=jnp.deg2rad(DICKINS_CASE.theta_min_deg),
+    theta_max=jnp.deg2rad(DICKINS_CASE.theta_max_deg),
+    n_beams=DICKINS_CASE.n_beams,
+    rr_grid=rr_grid,
+    rz_grid=rz_grid,
+    ds=DICKINS_CASE.ds_m,
+    beam_type="geometric",
+    run_mode="coherent",
+    accumulation_model=DICKINS_CASE.beam_influence_model,
+)
+
+print(result["tl_db"].shape)
+```
+
+## Example: Run A Munk Profile With Gaussian Beam Accumulation
+
+This example uses the Bellhop-style solver path, configures a flat-bottom Munk environment, and explicitly selects Gaussian beam accumulation:
+
+```python
+import jax.numpy as jnp
+from src.simulation import boundary as boundary_mod
+from src.simulation import dynamic_ray_tracing as dyn_mod
+from src.simulation import sound_speed as ssp_mod
+
+dyn_mod.configure_acoustic_operators(
+    sound_speed_operators=ssp_mod.MUNK_OPERATORS,
+    boundary_operators=boundary_mod.FLAT_BOUNDARY_OPERATORS,
+    reflection_model={
+        "source_type": "point",
+        "top_boundary_condition": "vacuum",
+        "bottom_boundary_condition": "acoustic_halfspace",
+        "bottom_alpha_r_mps": 1600.0,
+        "bottom_alpha_i_user": 0.8,
+        "bottom_density_gcc": 1.8,
+        "attenuation_units": "W",
+        "kill_backward_rays": False,
+    },
+)
+
+rr_grid = jnp.linspace(0.0, 100000.0, 1001)
+rz_grid = jnp.linspace(0.0, 5000.0, 501)
+
+result = dyn_mod.solve_transmission_loss(
+    freq=50.0,
+    r_s=0.0,
+    z_s=1000.0,
+    theta_min=jnp.deg2rad(-20.3),
+    theta_max=jnp.deg2rad(20.3),
+    n_beams=241,
+    rr_grid=rr_grid,
+    rz_grid=rz_grid,
+    ds=50.0,
+    beam_type="geometric",
+    run_mode="coherent",
+    accumulation_model="gaussian",
+    auto_beam_count=False,
+)
+
+print(result["tl_db"].shape)
+print(result["field_total"].shape)
+```
+
+To plot the resulting field with the Bellhop-style TL display rules:
+
+```python
+import matplotlib.pyplot as plt
+from src.plot import plot_tl_field
+
+fig, ax = plt.subplots(figsize=(12, 5))
+plot_tl_field(
+    rr_grid_m=rr_grid,
+    rz_grid_m=rz_grid,
+    tl_db=result["tl_db"],
+    ax=ax,
+    title="Munk Profile Gaussian-Beam TL",
+    freq_hz=50.0,
+    source_depth_m=1000.0,
+)
+plt.show()
+```
+
 ## Run The End-To-End Synthetic Pipeline
 
 ```bash
