@@ -118,6 +118,183 @@ dyn_mod.configure_acoustic_operators(
 )
 ```
 
+## Specify SSP, Bathymetry, And Altimetry In Python
+
+The solver is configured through:
+
+- `make_2d_ssp_operators(...)` in `src/simulation/sound_speed.py`
+- `make_boundary_operators(...)` in `src/simulation/boundary.py`
+- `configure_acoustic_operators(...)` in `src/simulation/dynamic_ray_tracing.py`
+
+In practice, you can specify the environment in two common ways:
+
+1. analytic Python/JAX functions
+2. sampled tables, interpolated with `jnp.interp`
+
+### Option 1: Specify SSP As A Python Function
+
+If you have an analytic SSP `c(r, z)`, wrap it with `make_2d_ssp_operators(...)`. The factory automatically builds the derivative operators needed by the tracer.
+
+```python
+import jax.numpy as jnp
+from src.simulation.sound_speed import make_2d_ssp_operators
+
+def c_custom(r, z):
+    c0 = 1480.0
+    gradient = 0.017
+    range_perturbation = 3.0 * jnp.sin(r / 20000.0)
+    return c0 + gradient * z + range_perturbation
+
+CUSTOM_SSP_OPERATORS = make_2d_ssp_operators(c_custom)
+```
+
+Use this pattern when:
+
+- your sound-speed model is naturally analytic
+- you want JAX to differentiate the SSP and its derivatives automatically
+
+### Option 2: Specify SSP As A Depth Table `z` vs `c(z)`
+
+If your SSP comes from measured or tabulated data, define depth and sound-speed arrays and interpolate them.
+
+```python
+import jax
+import jax.numpy as jnp
+from src.simulation.sound_speed import make_2d_ssp_operators
+
+z_knots_m = jnp.array([0.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2000.0], dtype=jnp.float64)
+c_knots_mps = jnp.array([1505.0, 1498.0, 1492.0, 1488.0, 1486.0, 1490.0, 1502.0], dtype=jnp.float64)
+
+@jax.jit
+def c_from_table(r, z):
+    del r
+    return jnp.interp(z, z_knots_m, c_knots_mps)
+
+TABLE_SSP_OPERATORS = make_2d_ssp_operators(c_from_table)
+TABLE_SSP_OPERATORS["interface_depths_m"] = z_knots_m
+```
+
+Notes:
+
+- `interface_depths_m` is optional but recommended when using layered or piecewise SSP data.
+- the tracer uses those depths for step reduction near SSP interfaces.
+
+### Option 3: Specify Bathymetry And Altimetry As Python Functions
+
+Bathymetry and altimetry are scalar functions of range `r`.
+
+```python
+import jax.numpy as jnp
+from src.simulation.boundary import make_boundary_operators
+
+def bathymetry_fn(r):
+    return 3000.0 - 2200.0 * jnp.exp(-((r - 25000.0) / 7000.0) ** 2)
+
+def altimetry_fn(r):
+    return 5.0 * jnp.sin(r / 8000.0)
+
+CUSTOM_BOUNDARY_OPERATORS = make_boundary_operators(
+    bathymetry_fn=bathymetry_fn,
+    altimetry_fn=altimetry_fn,
+)
+```
+
+Use this when:
+
+- bottom or surface shape is known analytically
+- you want JAX to differentiate slope and normals automatically
+
+Important requirement:
+
+- these functions must be JAX-compatible because the boundary operator factory differentiates them with `jax.grad`
+
+### Option 4: Specify Bathymetry And Altimetry As Range Tables
+
+If the geometry comes from sampled survey data, interpolate from range knots.
+
+```python
+import jax
+import jax.numpy as jnp
+from src.simulation.boundary import make_boundary_operators
+
+r_bathy_m = jnp.array([0.0, 10000.0, 20000.0, 30000.0, 100000.0], dtype=jnp.float64)
+z_bathy_m = jnp.array([3000.0, 3000.0, 500.0, 3000.0, 3000.0], dtype=jnp.float64)
+
+r_surface_m = jnp.array([0.0, 50000.0, 100000.0], dtype=jnp.float64)
+z_surface_m = jnp.array([0.0, 2.0, 0.0], dtype=jnp.float64)
+
+@jax.jit
+def bathymetry_from_table(r):
+    return jnp.interp(r, r_bathy_m, z_bathy_m)
+
+@jax.jit
+def altimetry_from_table(r):
+    return jnp.interp(r, r_surface_m, z_surface_m)
+
+TABLE_BOUNDARY_OPERATORS = make_boundary_operators(
+    bathymetry_fn=bathymetry_from_table,
+    altimetry_fn=altimetry_from_table,
+)
+TABLE_BOUNDARY_OPERATORS["bathymetry_range_breaks_m"] = r_bathy_m
+TABLE_BOUNDARY_OPERATORS["altimetry_range_breaks_m"] = r_surface_m
+```
+
+Notes:
+
+- `bathymetry_range_breaks_m` and `altimetry_range_breaks_m` are optional but recommended for piecewise or tabulated geometry.
+- the tracer uses those breakpoints to reduce step size near slope changes and range-segment boundaries.
+
+### Full Example: Configure The Solver With Table-Based SSP And Bathymetry
+
+```python
+import jax
+import jax.numpy as jnp
+from src.simulation import dynamic_ray_tracing as dyn_mod
+from src.simulation.boundary import make_boundary_operators
+from src.simulation.sound_speed import make_2d_ssp_operators
+
+z_knots_m = jnp.array([0.0, 100.0, 300.0, 1000.0, 3000.0], dtype=jnp.float64)
+c_knots_mps = jnp.array([1502.0, 1494.0, 1488.0, 1490.0, 1504.0], dtype=jnp.float64)
+
+@jax.jit
+def c_from_table(r, z):
+    del r
+    return jnp.interp(z, z_knots_m, c_knots_mps)
+
+ssp_operators = make_2d_ssp_operators(c_from_table)
+ssp_operators["interface_depths_m"] = z_knots_m
+
+r_bathy_m = jnp.array([0.0, 20000.0, 50000.0, 100000.0], dtype=jnp.float64)
+z_bathy_m = jnp.array([3500.0, 3200.0, 2800.0, 3000.0], dtype=jnp.float64)
+
+@jax.jit
+def bathymetry_from_table(r):
+    return jnp.interp(r, r_bathy_m, z_bathy_m)
+
+@jax.jit
+def flat_surface(r):
+    return 0.0 * r
+
+boundary_operators = make_boundary_operators(
+    bathymetry_fn=bathymetry_from_table,
+    altimetry_fn=flat_surface,
+)
+boundary_operators["bathymetry_range_breaks_m"] = r_bathy_m
+
+dyn_mod.configure_acoustic_operators(
+    sound_speed_operators=ssp_operators,
+    boundary_operators=boundary_operators,
+    reflection_model={
+        "source_type": "point",
+        "top_boundary_condition": "vacuum",
+        "bottom_boundary_condition": "acoustic_halfspace",
+        "kill_backward_rays": False,
+    },
+)
+```
+
+After this configuration, call `solve_transmission_loss(...)` or `solve_transmission_loss_autodiff(...)` as usual.
+
 ## Run A Validation Benchmark
 
 ```bash
