@@ -2,6 +2,19 @@
 import jax
 import jax.numpy as jnp
 
+DEFAULT_PROFILE_Z = jnp.array([
+    0.0, 38.0, 50.0, 70.0, 100.0, 140.0, 160.0, 170.0, 200.0,
+    215.0, 250.0, 300.0, 370.0, 450.0, 500.0, 700.0, 900.0,
+    1000.0, 1250.0, 1500.0, 2000.0, 2500.0, 3000.0,
+], dtype=jnp.float64)
+
+DEFAULT_PROFILE_C = jnp.array([
+    1476.7, 1476.7, 1472.6, 1468.8, 1467.2, 1471.6, 1473.6,
+    1473.6, 1472.7, 1472.2, 1471.6, 1471.6, 1472.0, 1472.7,
+    1473.1, 1474.9, 1477.0, 1478.1, 1480.7, 1483.8, 1490.5,
+    1498.3, 1506.5,
+], dtype=jnp.float64)
+
 
 def make_2d_ssp_operators(c_fn):
     """
@@ -21,19 +34,13 @@ def make_2d_ssp_operators(c_fn):
         "c_rr": c_rr_eval,
         "c_rz": c_rz_eval,
         "c_zz": c_zz_eval,
+        "interface_depths_m": jnp.asarray([], dtype=jnp.float64),
     }
 
 
 @jax.jit
 def default_profile(z):
-    c0_vals = jnp.array([1476.7, 1476.7, 1472.6, 1468.8, 1467.2, 1471.6, 1473.6,
-                          1473.6, 1472.7, 1472.2, 1471.6, 1471.6, 1472.0, 1472.7,
-                          1473.1, 1474.9, 1477.0, 1478.1, 1480.7, 1483.8, 1490.5,
-                          1498.3, 1506.5], dtype=jnp.float64)
-    z0 = jnp.array([0.0, 38.0, 50.0, 70.0, 100.0, 140.0, 160.0, 170.0, 200.0,
-                    215.0, 250.0, 300.0, 370.0, 450.0, 500.0, 700.0, 900.0,
-                    1000.0, 1250.0, 1500.0, 2000.0, 2500.0, 3000.0], dtype=jnp.float64)
-    return jnp.interp(z, z0, c0_vals)
+    return jnp.interp(z, DEFAULT_PROFILE_Z, DEFAULT_PROFILE_C)
 
 
 @jax.jit
@@ -112,4 +119,5 @@ DEFAULT_OPERATORS = {
     "c_rr": c_rr,
     "c_rz": c_rz,
     "c_zz": c_zz,
+    "interface_depths_m": DEFAULT_PROFILE_Z,
 }

@@ -3,6 +3,9 @@ import jax
 import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
+BATHY_RANGE_KNOTS = jnp.array([0.0, 10000.0, 20000.0, 30000.0, 100000.0], dtype=jnp.float64)
+BATHY_DEPTH_KNOTS = jnp.array([3000.0, 3000.0, 500.0, 3000.0, 3000.0], dtype=jnp.float64)
+
 
 @jax.jit
 def flat_bathymetry(r):
@@ -15,9 +18,7 @@ def bathymetry(r):
     Returns the bottom depth (bathymetry) at range r.
     """
     b = 3000.0
-    ro = jnp.array([0.0, 10000.0, 20000.0, 30000.0, 100000.0], dtype=jnp.float64)
-    z0 = jnp.array([b, b, 500.0, b, b], dtype=jnp.float64)
-    z = jnp.interp(r, ro, z0)
+    z = jnp.interp(r, BATHY_RANGE_KNOTS, BATHY_DEPTH_KNOTS)
     return z
 
 @jax.jit
@@ -103,6 +104,8 @@ def make_boundary_operators(bathymetry_fn, altimetry_fn):
         "normal_vector_to_bathymetry": normal_vector_to_bathymetry_eval,
         "tangent_vector_to_altimetry": tangent_vector_to_altimetry_eval,
         "normal_vector_to_altimetry": normal_vector_to_altimetry_eval,
+        "bathymetry_range_breaks_m": jnp.asarray([], dtype=jnp.float64),
+        "altimetry_range_breaks_m": jnp.asarray([], dtype=jnp.float64),
     }
 
 @jax.jit
@@ -128,3 +131,4 @@ def normal_vector_to_altimetry(r):
 
 DEFAULT_BOUNDARY_OPERATORS = make_boundary_operators(bathymetry, altimetry)
 FLAT_BOUNDARY_OPERATORS = make_boundary_operators(flat_bathymetry, altimetry)
+DEFAULT_BOUNDARY_OPERATORS["bathymetry_range_breaks_m"] = BATHY_RANGE_KNOTS

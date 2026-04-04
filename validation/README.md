@@ -18,6 +18,8 @@ The goal is to support validation artifacts for:
 
 - `cases.py`: benchmark case definitions and sampling grids
 - `export_bellhop_inputs.py`: exports case manifests, SSP tables, bathymetry tables, and Bellhop input templates
+- `import_bellhop_reference.py`: imports Bellhop `.shd` outputs into the CSV reference format used by the benchmark runner
+- `read_shd_bin.py`: Bellhop binary shade-file reader
 - `run_benchmarks.py`: runs the JAX solver, loads Bellhop reference grids if available, computes metrics, and writes figures/reports
 - `metrics.py`: quantitative comparison metrics
 - `reference_data/`: place Bellhop-exported reference grids here
@@ -58,18 +60,30 @@ Files written per case:
 
 The `.env` files are repository-generated templates intended to standardize the case setup. They should be checked against the Bellhop version and Acoustics Toolbox conventions used in your validation environment before publication.
 
-3. Export Bellhop results onto the same grids used by the JAX solver and place them in:
+3. Import Bellhop `.shd` results into the validation reference directory:
+
+```bash
+python validation/import_bellhop_reference.py --case all
+```
+
+This writes:
 
 - `validation/reference_data/<case>/rr_grid_m.csv`
 - `validation/reference_data/<case>/rz_grid_m.csv`
 - `validation/reference_data/<case>/tl_field_db.csv`
 
-The reference field should be a `Nz x Nr` CSV with TL in dB.
+The reference field is stored as a `Nz x Nr` CSV with TL in dB.
 
 ## Running the benchmark suite
 
 ```bash
 python validation/run_benchmarks.py --case all
+```
+
+To let the solver replace the requested beam count with its Bellhop-style recommended beam count:
+
+```bash
+python validation/run_benchmarks.py --case all --auto-beam-count
 ```
 
 Outputs are written to `validation/results/<case>/`:
@@ -93,6 +107,13 @@ For the full TL field and each requested TL-vs-range slice:
 - Pearson correlation
 
 The report also includes solver runtime for the JAX solve.
+It also records:
+
+- requested beam count
+- actual beam count used by the solver
+- Bellhop-style recommended beam count
+- whether auto beam count was enabled
+- min/max launch amplitude from the source beam pattern normalization
 
 ## Validation guidance
 
@@ -108,3 +129,4 @@ For validation, the minimum standard should be:
 ## Current limitations
 
 - Boundary loss models and full Bellhop-equivalent field accumulation are still incomplete, so discrepancies are expected even after the benchmark pipeline is populated with Bellhop outputs.
+- Source beam patterns are supported in the validation path, but the current benchmark cases still use the Bellhop default omnidirectional pattern unless case metadata are extended with explicit pattern tables.

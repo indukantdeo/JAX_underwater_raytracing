@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -16,8 +17,12 @@ if str(SRC) not in sys.path:
 if str(ROOT / "src" / "simulation") not in sys.path:
     sys.path.append(str(ROOT / "src" / "simulation"))
 
-from cases import BENCHMARK_CASES, get_bathymetry_sampler, get_ssp_sampler
-from metrics import safe_correlation, summarize_difference
+try:
+    from cases import BENCHMARK_CASES, get_bathymetry_sampler, get_ssp_sampler
+    from metrics import safe_correlation, summarize_difference
+except ModuleNotFoundError:
+    from validation.cases import BENCHMARK_CASES, get_bathymetry_sampler, get_ssp_sampler
+    from validation.metrics import safe_correlation, summarize_difference
 
 
 def _load_runtime_modules():
@@ -40,15 +45,30 @@ def _configure_case(case, boundary_mod, dyn_mod, ssp_mod):
     else:
         boundary_operators = boundary_mod.DEFAULT_BOUNDARY_OPERATORS
 
-    dyn_mod.configure_acoustic_operators(sound_speed_operators, boundary_operators)
+    reflection_model = {
+        "source_type": "point",
+        "top_boundary_condition": case.top_boundary_condition,
+        "bottom_boundary_condition": case.bottom_boundary_condition,
+        "kill_backward_rays": case.kill_backward_rays,
+        "bottom_alpha_r_mps": case.bottom_alpha_r_mps,
+        "bottom_alpha_i_user": case.bottom_alpha_i_user,
+        "bottom_beta_r_mps": case.bottom_beta_r_mps,
+        "bottom_beta_i_user": case.bottom_beta_i_user,
+        "bottom_density_gcc": case.bottom_density_gcc,
+        "attenuation_units": case.attenuation_units,
+    }
+
+    dyn_mod.configure_acoustic_operators(sound_speed_operators, boundary_operators, reflection_model)
 
 
-def _run_solver(case):
+def _run_solver(case, *, rr_grid=None, rz_grid=None, n_beams=None, auto_beam_count: bool | None = None):
     jnp, boundary_mod, dyn_mod, ssp_mod = _load_runtime_modules()
     _configure_case(case, boundary_mod, dyn_mod, ssp_mod)
 
-    rr_grid = jnp.asarray(case.rr_grid)
-    rz_grid = jnp.asarray(case.rz_grid)
+    rr_grid = jnp.asarray(case.rr_grid if rr_grid is None else rr_grid)
+    rz_grid = jnp.asarray(case.rz_grid if rz_grid is None else rz_grid)
+    n_beams = case.n_beams if n_beams is None else n_beams
+    auto_beam_count = case.auto_beam_count if auto_beam_count is None else auto_beam_count
 
     t0 = time.perf_counter()
     result = dyn_mod.solve_transmission_loss(
@@ -57,12 +77,16 @@ def _run_solver(case):
         case.source_depth_m,
         np.deg2rad(case.theta_min_deg),
         np.deg2rad(case.theta_max_deg),
-        case.n_beams,
+        n_beams,
         rr_grid,
         rz_grid,
         ds=case.ds_m,
         beam_type="geometric",
         coherent=True,
+        accumulation_model=case.beam_influence_model,
+        auto_beam_count=auto_beam_count,
+        source_beam_pattern_angles_deg=case.source_beam_pattern_angles_deg,
+        source_beam_pattern_db=case.source_beam_pattern_db,
     )
     runtime_s = time.perf_counter() - t0
 
@@ -71,6 +95,12 @@ def _run_solver(case):
         "rz_grid_m": np.asarray(rz_grid),
         "tl_db": np.asarray(result["tl_db"]),
         "runtime_s": runtime_s,
+        "requested_n_beams": int(n_beams),
+        "actual_n_beams": int(np.asarray(result["theta"]).shape[0]),
+        "recommended_n_beams": int(np.asarray(result["n_beams_recommended"]).item()),
+        "auto_beam_count": bool(auto_beam_count),
+        "source_amplitude_min": float(np.min(np.asarray(result["source_amplitudes"]))),
+        "source_amplitude_max": float(np.max(np.asarray(result["source_amplitudes"]))),
     }
 
 
@@ -98,6 +128,17 @@ def _load_reference(case_name: str, reference_root: Path) -> dict:
 
 def _nearest_depth_index(rz_grid_m: np.ndarray, depth_m: float) -> int:
     return int(np.argmin(np.abs(rz_grid_m - depth_m)))
+
+
+def _resample_reference_to_solver_grid(reference: dict, solver_result: dict) -> dict:
+    rr_idx = np.array([int(np.argmin(np.abs(reference["rr_grid_m"] - rr))) for rr in solver_result["rr_grid_m"]], dtype=int)
+    rz_idx = np.array([int(np.argmin(np.abs(reference["rz_grid_m"] - rz))) for rz in solver_result["rz_grid_m"]], dtype=int)
+    tl_db = reference["tl_db"][np.ix_(rz_idx, rr_idx)]
+    return {
+        "rr_grid_m": reference["rr_grid_m"][rr_idx],
+        "rz_grid_m": reference["rz_grid_m"][rz_idx],
+        "tl_db": tl_db,
+    }
 
 
 def _save_plots(case, solver_result: dict, reference: dict | None, out_dir: Path) -> None:
@@ -162,7 +203,12 @@ def _build_report(case, solver_result: dict, reference: dict | None, out_dir: Pa
         "case": case.name,
         "runtime_s": solver_result["runtime_s"],
         "frequency_hz": case.frequency_hz,
-        "n_beams": case.n_beams,
+        "n_beams_requested": solver_result["requested_n_beams"],
+        "n_beams_actual": solver_result["actual_n_beams"],
+        "n_beams_recommended": solver_result["recommended_n_beams"],
+        "auto_beam_count": solver_result["auto_beam_count"],
+        "source_amplitude_min": solver_result["source_amplitude_min"],
+        "source_amplitude_max": solver_result["source_amplitude_max"],
         "ds_m": case.ds_m,
     }
 
@@ -192,7 +238,11 @@ def _write_markdown_report(case, report: dict, out_dir: Path) -> None:
         "",
         f"- Frequency: `{case.frequency_hz:.2f} Hz`",
         f"- Source depth: `{case.source_depth_m:.2f} m`",
-        f"- Beams: `{case.n_beams}`",
+        f"- Requested beams: `{report['n_beams_requested']}`",
+        f"- Actual beams used: `{report['n_beams_actual']}`",
+        f"- Bellhop-recommended beams: `{report['n_beams_recommended']}`",
+        f"- Auto beam count: `{report['auto_beam_count']}`",
+        f"- Source amplitude range: `[{report['source_amplitude_min']:.6f}, {report['source_amplitude_max']:.6f}]`",
         f"- Step size: `{case.ds_m:.2f} m`",
         f"- Solver runtime: `{report['runtime_s']:.6f} s`",
         f"- Status: `{report['status']}`",
@@ -220,22 +270,50 @@ def _write_markdown_report(case, report: dict, out_dir: Path) -> None:
     (out_dir / f"{case.name}_report.md").write_text("\n".join(lines))
 
 
-def run_case(case_name: str, reference_root: Path, out_root: Path) -> dict:
+def run_case(
+    case_name: str,
+    reference_root: Path,
+    out_root: Path,
+    *,
+    n_beams_override: int | None = None,
+    auto_beam_count_override: bool | None = None,
+    range_stride: int = 1,
+    depth_stride: int = 1,
+) -> dict:
     case = BENCHMARK_CASES[case_name]
     out_dir = out_root / case_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    solver_result = _run_solver(case)
+    rr_grid = case.rr_grid[::range_stride]
+    rz_grid = case.rz_grid[::depth_stride]
+    requested_n_beams = case.n_beams if n_beams_override is None else n_beams_override
+    auto_beam_count = case.auto_beam_count if auto_beam_count_override is None else auto_beam_count_override
+    case_for_report = replace(case, n_beams=requested_n_beams, auto_beam_count=auto_beam_count)
+    solver_result = _run_solver(
+        case,
+        rr_grid=rr_grid,
+        rz_grid=rz_grid,
+        n_beams=n_beams_override,
+        auto_beam_count=auto_beam_count,
+    )
 
     reference = None
     try:
         reference = _load_reference(case_name, reference_root)
+        if (
+            reference["tl_db"].shape != solver_result["tl_db"].shape
+            or not np.allclose(reference["rr_grid_m"], solver_result["rr_grid_m"])
+            or not np.allclose(reference["rz_grid_m"], solver_result["rz_grid_m"])
+        ):
+            reference = _resample_reference_to_solver_grid(reference, solver_result)
     except FileNotFoundError:
         pass
 
-    _save_plots(case, solver_result, reference, out_dir)
-    report = _build_report(case, solver_result, reference, out_dir)
-    _write_markdown_report(case, report, out_dir)
+    _save_plots(case_for_report, solver_result, reference, out_dir)
+    report = _build_report(case_for_report, solver_result, reference, out_dir)
+    report["range_stride"] = int(range_stride)
+    report["depth_stride"] = int(depth_stride)
+    _write_markdown_report(case_for_report, report, out_dir)
     (out_dir / f"{case.name}_report.json").write_text(json.dumps(report, indent=2))
     np.savetxt(out_dir / "rr_grid_m.csv", solver_result["rr_grid_m"], delimiter=",")
     np.savetxt(out_dir / "rz_grid_m.csv", solver_result["rz_grid_m"], delimiter=",")
@@ -248,12 +326,27 @@ def main() -> None:
     parser.add_argument("--case", choices=["all", *BENCHMARK_CASES.keys()], default="all")
     parser.add_argument("--reference-root", default="validation/reference_data")
     parser.add_argument("--out-root", default="validation/results")
+    parser.add_argument("--n-beams", type=int, default=None)
+    parser.add_argument("--auto-beam-count", action="store_true")
+    parser.add_argument("--range-stride", type=int, default=1)
+    parser.add_argument("--depth-stride", type=int, default=1)
     args = parser.parse_args()
 
     case_names = list(BENCHMARK_CASES) if args.case == "all" else [args.case]
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
-    reports = [run_case(case_name, Path(args.reference_root), out_root) for case_name in case_names]
+    reports = [
+        run_case(
+            case_name,
+            Path(args.reference_root),
+            out_root,
+            n_beams_override=args.n_beams,
+            auto_beam_count_override=args.auto_beam_count,
+            range_stride=args.range_stride,
+            depth_stride=args.depth_stride,
+        )
+        for case_name in case_names
+    ]
     (out_root / "summary.json").write_text(json.dumps(reports, indent=2))
 
 

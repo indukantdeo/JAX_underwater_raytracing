@@ -25,6 +25,19 @@ class BenchmarkCase:
     tl_slice_depths_m: tuple[float, ...]
     sound_speed_profile: str
     bathymetry_profile: str
+    top_boundary_condition: str
+    bottom_boundary_condition: str
+    bottom_alpha_r_mps: float
+    bottom_alpha_i_user: float
+    bottom_beta_r_mps: float
+    bottom_beta_i_user: float
+    bottom_density_gcc: float
+    attenuation_units: str
+    beam_influence_model: str
+    auto_beam_count: bool
+    kill_backward_rays: bool = False
+    source_beam_pattern_angles_deg: tuple[float, ...] | None = None
+    source_beam_pattern_db: tuple[float, ...] | None = None
 
     @property
     def rr_grid(self) -> np.ndarray:
@@ -73,17 +86,28 @@ MUNK_CASE = BenchmarkCase(
     frequency_hz=50.0,
     source_range_m=0.0,
     source_depth_m=1000.0,
-    theta_min_deg=-18.0,
-    theta_max_deg=18.0,
+    theta_min_deg=-20.3,
+    theta_max_deg=20.3,
     n_beams=241,
-    ds_m=10.0,
+    ds_m=50.0,
     max_range_m=100000.0,
     max_depth_m=5000.0,
-    n_range=801,
+    n_range=1001,
     n_depth=501,
     tl_slice_depths_m=(1000.0, 1500.0),
     sound_speed_profile="munk",
     bathymetry_profile="flat",
+    top_boundary_condition="vacuum",
+    bottom_boundary_condition="acoustic_halfspace",
+    bottom_alpha_r_mps=1600.0,
+    bottom_alpha_i_user=0.8,
+    bottom_beta_r_mps=0.0,
+    bottom_beta_i_user=0.0,
+    bottom_density_gcc=1.8,
+    attenuation_units="W",
+    beam_influence_model="hat",
+    auto_beam_count=False,
+    kill_backward_rays=False,
 )
 
 
@@ -104,6 +128,17 @@ DICKINS_CASE = BenchmarkCase(
     tl_slice_depths_m=(18.0, 250.0, 1000.0),
     sound_speed_profile="default",
     bathymetry_profile="dickins",
+    top_boundary_condition="vacuum",
+    bottom_boundary_condition="acoustic_halfspace",
+    bottom_alpha_r_mps=1550.0,
+    bottom_alpha_i_user=0.5,
+    bottom_beta_r_mps=0.0,
+    bottom_beta_i_user=0.0,
+    bottom_density_gcc=1.5,
+    attenuation_units="W",
+    beam_influence_model="gaussian",
+    auto_beam_count=False,
+    kill_backward_rays=True,
 )
 
 

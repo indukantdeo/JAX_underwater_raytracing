@@ -18,10 +18,31 @@ from boundary import (
     DEFAULT_BOUNDARY_OPERATORS,
 )
 
+DEFAULT_REFLECTION_MODEL = {
+    "source_type": "point",
+    "water_density_gcc": 1.0,
+    "top_boundary_condition": "vacuum",
+    "bottom_boundary_condition": "rigid",
+    "kill_backward_rays": False,
+    "bottom_alpha_r_mps": 1600.0,
+    "bottom_alpha_i_user": 0.0,
+    "bottom_beta_r_mps": 0.0,
+    "bottom_beta_i_user": 0.0,
+    "bottom_density_gcc": 1.8,
+    "attenuation_units": "W",
+}
 
-def configure_acoustic_operators(sound_speed_operators=None, boundary_operators=None):
+DEFAULT_STEP_CONTROL = {
+    "ssp_interface_depths_m": jnp.asarray([], dtype=jnp.float64),
+    "bathymetry_range_breaks_m": jnp.asarray([], dtype=jnp.float64),
+    "altimetry_range_breaks_m": jnp.asarray([], dtype=jnp.float64),
+}
+
+
+def configure_acoustic_operators(sound_speed_operators=None, boundary_operators=None, reflection_model=None):
     global c, c_r, c_z, c_rr, c_zz, c_rz
     global bty, ati, n_bty, n_ati, t_ati, t_bty
+    global REFLECTION_MODEL, STEP_CONTROL
 
     ssp = DEFAULT_OPERATORS if sound_speed_operators is None else sound_speed_operators
     bdry = DEFAULT_BOUNDARY_OPERATORS if boundary_operators is None else boundary_operators
@@ -39,6 +60,88 @@ def configure_acoustic_operators(sound_speed_operators=None, boundary_operators=
     n_ati = bdry["normal_vector_to_altimetry"]
     t_bty = bdry["tangent_vector_to_bathymetry"]
     t_ati = bdry["tangent_vector_to_altimetry"]
+    REFLECTION_MODEL = dict(DEFAULT_REFLECTION_MODEL)
+    if reflection_model is not None:
+        REFLECTION_MODEL.update(reflection_model)
+    STEP_CONTROL = {
+        "ssp_interface_depths_m": ssp.get("interface_depths_m", jnp.asarray([], dtype=jnp.float64)),
+        "bathymetry_range_breaks_m": bdry.get("bathymetry_range_breaks_m", jnp.asarray([], dtype=jnp.float64)),
+        "altimetry_range_breaks_m": bdry.get("altimetry_range_breaks_m", jnp.asarray([], dtype=jnp.float64)),
+    }
+
+
+REFLECTION_MODEL = dict(DEFAULT_REFLECTION_MODEL)
+STEP_CONTROL = dict(DEFAULT_STEP_CONTROL)
+
+
+def bellhop_recommended_nbeams(freq, c0, r_max, theta_min, theta_max):
+    d_alpha_opt = jnp.sqrt(c0 / (6.0 * freq * jnp.maximum(r_max, 1.0)))
+    span = jnp.maximum(theta_max - theta_min, 0.0)
+    n_opt = jnp.round(2.0 + span / (d_alpha_opt + 1e-12))
+    return jnp.maximum(1, n_opt.astype(jnp.int32))
+
+
+def evaluate_source_beam_pattern(theta_rad, pattern_angles_deg=None, pattern_db=None):
+    if pattern_angles_deg is None or pattern_db is None:
+        return jnp.ones_like(theta_rad, dtype=jnp.float64)
+
+    angles_deg = jnp.asarray(pattern_angles_deg, dtype=jnp.float64)
+    gains_db = jnp.asarray(pattern_db, dtype=jnp.float64)
+    if angles_deg.ndim != 1 or gains_db.ndim != 1:
+        raise ValueError("Source beam pattern angles and dB arrays must be one-dimensional.")
+    if angles_deg.shape[0] != gains_db.shape[0]:
+        raise ValueError("Source beam pattern angles and dB arrays must have the same length.")
+    if angles_deg.shape[0] < 2:
+        raise ValueError("Source beam pattern must contain at least two points.")
+
+    launch_angles_deg = jnp.rad2deg(theta_rad)
+    gains_linear = 10.0 ** (gains_db / 20.0)
+    return jnp.interp(launch_angles_deg, angles_deg, gains_linear)
+
+
+def _complex_sound_speed(real_speed, attenuation_value, freq, atten_unit):
+    omega = 2.0 * jnp.pi * freq
+    alpha_nepers_per_m = jnp.where(
+        atten_unit == 'W',
+        attenuation_value * freq / (8.6858896 * real_speed + 1e-12),
+        attenuation_value / 8.6858896,
+    )
+    imag_speed = alpha_nepers_per_m * real_speed * real_speed / (omega + 1e-12)
+    return real_speed + 1j * imag_speed
+
+
+def _acoustic_halfspace_reflection_coefficient(freq, c_water, tangential_component, normal_component):
+    omega = 2.0 * jnp.pi * freq
+    cp_bottom = _complex_sound_speed(
+        REFLECTION_MODEL["bottom_alpha_r_mps"],
+        REFLECTION_MODEL["bottom_alpha_i_user"],
+        freq,
+        REFLECTION_MODEL["attenuation_units"],
+    )
+    rho_water = REFLECTION_MODEL["water_density_gcc"]
+    rho_bottom = REFLECTION_MODEL["bottom_density_gcc"]
+
+    kx = omega * tangential_component
+    kz = omega * normal_component
+    kz_p = jnp.sqrt(kx * kx - (omega / cp_bottom) ** 2)
+    kz_p = jnp.where(
+        jnp.logical_and(jnp.isclose(jnp.real(kz_p), 0.0), jnp.imag(kz_p) < 0.0),
+        -kz_p,
+        kz_p,
+    )
+    return -(rho_water * kz_p - 1j * kz * rho_bottom) / (rho_water * kz_p + 1j * kz * rho_bottom + 1e-12)
+
+
+def _apply_boundary_reflection(Y_new, coeff, bounce_index):
+    amp = jnp.abs(coeff)
+    phase = jnp.arctan2(jnp.imag(coeff), jnp.real(coeff))
+    if Y_new.shape[0] > bounce_index:
+        Y_new = Y_new.at[bounce_index].set(Y_new[bounce_index] + 1.0)
+    if Y_new.shape[0] > 11:
+        Y_new = Y_new.at[11].set(Y_new[11] + jnp.log(jnp.maximum(amp, 1e-12)))
+    if Y_new.shape[0] > 12:
+        Y_new = Y_new.at[12].set(Y_new[12] + phase)
+    return Y_new
 
 
 
@@ -50,7 +153,7 @@ def dynamic_ray_eqns(Y):
     
     State: Y = [r, z, rho, zeta, q_r, q_i, p_r, p_i, tau]
     """
-    r, z, rho, zeta, q_r, q_i, p_r, p_i, tau = Y
+    r, z, rho, zeta, q_r, q_i, p_r, p_i, tau = Y[:9]
 
     # Sound speed and derivatives
     c_val = c(r, z)
@@ -90,15 +193,76 @@ def dynamic_ray_eqns(Y):
 
 # Modified RK2 stepper with reflection counting.
 class RK2_stepper:
-    def __init__(self, function, dt, ati=None, bty=None, t_ati=None, n_ati=None, t_bty=None, n_bty=None):
+    def __init__(self, function, dt, freq=None, ati=None, bty=None, t_ati=None, n_ati=None, t_bty=None, n_bty=None):
         self.function = function  # Expecting extended_ray_eqns.
         self.dt = dt
+        self.freq = 0.0 if freq is None else freq
         self.ati = ati if ati is not None else globals()["ati"]
         self.bty = bty if bty is not None else globals()["bty"]
         self.n_bty = n_bty if n_bty is not None else globals()["n_bty"]
         self.t_bty = t_bty if t_bty is not None else globals()["t_bty"]
         self.t_ati = t_ati if t_ati is not None else globals()["t_ati"]
         self.n_ati = n_ati if n_ati is not None else globals()["n_ati"]
+
+    def _crossing_step_to_depths(self, z0, dzds, h, depth_breaks):
+        if depth_breaks.size == 0:
+            return jnp.inf
+        z1 = z0 + h * dzds
+        between = jnp.logical_or(
+            jnp.logical_and(depth_breaks > z0, depth_breaks <= z1),
+            jnp.logical_and(depth_breaks < z0, depth_breaks >= z1),
+        )
+        cand = (depth_breaks - z0) / (dzds + 1e-12)
+        cand = jnp.where(jnp.logical_and(between, cand > 0.0), cand, jnp.inf)
+        return jnp.min(cand)
+
+    def _crossing_step_to_range_breaks(self, r0, drds, h, range_breaks):
+        if range_breaks.size == 0:
+            return jnp.inf
+        r1 = r0 + h * drds
+        between = jnp.logical_or(
+            jnp.logical_and(range_breaks > r0, range_breaks <= r1),
+            jnp.logical_and(range_breaks < r0, range_breaks >= r1),
+        )
+        cand = (range_breaks - r0) / (drds + 1e-12)
+        cand = jnp.where(jnp.logical_and(between, cand > 0.0), cand, jnp.inf)
+        return jnp.min(cand)
+
+    def _reduce_step(self, Y, c_local, h):
+        c_tray = c_local * jnp.array([Y[2], Y[3]])
+        r0, z0 = Y[0], Y[1]
+        x_trial = jnp.array([r0, z0]) + h * c_tray
+
+        h_layer = self._crossing_step_to_depths(z0, c_tray[1], h, STEP_CONTROL["ssp_interface_depths_m"])
+
+        f_top0 = z0 - self.ati(r0)
+        f_top1 = x_trial[1] - self.ati(x_trial[0])
+        dtop_dr = jax.grad(self.ati)(r0)
+        denom_top = c_tray[1] - dtop_dr * c_tray[0]
+        h_top = jax.lax.cond(
+            jnp.logical_and(f_top0 >= 0.0, f_top1 < 0.0),
+            lambda _: -f_top0 / (denom_top + 1e-12),
+            lambda _: jnp.inf,
+            operand=None,
+        )
+
+        f_bot0 = z0 - self.bty(r0)
+        f_bot1 = x_trial[1] - self.bty(x_trial[0])
+        dbot_dr = jax.grad(self.bty)(r0)
+        denom_bot = c_tray[1] - dbot_dr * c_tray[0]
+        h_bot = jax.lax.cond(
+            jnp.logical_and(f_bot0 <= 0.0, f_bot1 > 0.0),
+            lambda _: -f_bot0 / (denom_bot + 1e-12),
+            lambda _: jnp.inf,
+            operand=None,
+        )
+
+        h_top_seg = self._crossing_step_to_range_breaks(r0, c_tray[0], h, STEP_CONTROL["altimetry_range_breaks_m"])
+        h_bot_seg = self._crossing_step_to_range_breaks(r0, c_tray[0], h, STEP_CONTROL["bathymetry_range_breaks_m"])
+
+        h_new = jnp.min(jnp.asarray([h, h_layer, h_top, h_bot, h_top_seg, h_bot_seg]))
+        h_new = jnp.where(jnp.logical_or(~jnp.isfinite(h_new), h_new <= 0.0), h, h_new)
+        return jnp.where(h_new < 1.0e-4 * self.dt, 1.0e-5 * self.dt, h_new)
 
     def bottom_reflection(self, Y, Y_new):
         # Reflection handling for bottom (bathymetry).
@@ -113,6 +277,7 @@ class RK2_stepper:
         
         K = Y + (dt_tilde / 2.0) * self.function(Y)
         Y_new = Y + dt_tilde * self.function(K)
+        Y_new = Y_new.at[1].set(self.bty(Y_new[0]))
         
         # alpha = jnp.arctan(jax.grad(self.bty)(Y_new[0]))
         # theta = jnp.arctan(Y_new[3] / Y_new[2])
@@ -183,6 +348,18 @@ class RK2_stepper:
         # p = p + q*N  (your state: q_r,q_i at [4],[5]; p_r,p_i at [6],[7])
         Y_new = Y_new.at[6].set(Y_new[6] + Y_new[4] * N)
         Y_new = Y_new.at[7].set(Y_new[7] + Y_new[5] * N)
+        bottom_coeff = jax.lax.cond(
+            REFLECTION_MODEL["bottom_boundary_condition"] == "acoustic_halfspace",
+            lambda _: _acoustic_halfspace_reflection_coefficient(
+                self.freq,
+                C_new,
+                beta,
+                alpha,
+            ),
+            lambda _: 1.0 + 0.0j,
+            operand=None,
+        )
+        Y_new = _apply_boundary_reflection(Y_new, bottom_coeff, 10)
 
         return Y_new
 
@@ -200,6 +377,7 @@ class RK2_stepper:
         
         K = Y + (dt_tilde / 2.0) * self.function(Y)
         Y_new = Y + dt_tilde * self.function(K)
+        Y_new = Y_new.at[1].set(self.ati(Y_new[0]))
         
         # alpha = jnp.arctan(jax.grad(self.ati)(Y_new[0]))
         # theta = jnp.arctan(Y_new[3] / Y_new[2])
@@ -263,6 +441,13 @@ class RK2_stepper:
 
         Y_new = Y_new.at[6].set(Y_new[6] + Y_new[4] * N)
         Y_new = Y_new.at[7].set(Y_new[7] + Y_new[5] * N)
+        top_coeff = jax.lax.cond(
+            REFLECTION_MODEL["top_boundary_condition"] == "vacuum",
+            lambda _: -1.0 + 0.0j,
+            lambda _: 1.0 + 0.0j,
+            operand=None,
+        )
+        Y_new = _apply_boundary_reflection(Y_new, top_coeff, 9)
 
         return Y_new
 
@@ -270,8 +455,18 @@ class RK2_stepper:
     def __call__(self, Y):
         X0 = jnp.array([Y[0], Y[1]])
         Y_pass = jnp.copy(Y)
-        K = Y + (self.dt / 2.0) * self.function(Y)
-        Y_new = Y + self.dt * self.function(K)
+        c0 = c(Y[0], Y[1])
+        h0 = self._reduce_step(Y, c0, self.dt)
+
+        f0 = self.function(Y)
+        K = Y + 0.5 * h0 * f0
+        c1 = c(K[0], K[1])
+        h1 = self._reduce_step(Y, c1, h0)
+        halfh = 0.5 * h0
+        w1 = h1 / (2.0 * halfh + 1e-12)
+        w0 = 1.0 - w1
+        f1 = self.function(K)
+        Y_new = Y + h1 * (w0 * f0 + w1 * f1)
         X = jnp.array([Y_new[0], Y_new[1]])
         
         n_bty = self.n_bty(Y[0])
@@ -304,13 +499,15 @@ class RK2_stepper:
 def rollout(stepper, n, *, include_init: bool = True):
     def scan_fn(Y, _):
         Y_next = stepper(Y)
-        theta = jnp.arctan(Y_next[3] / Y_next[2])
-        theta_logic = jnp.logical_or(jnp.abs(theta) >= jnp.pi / 2.0, jnp.isnan(Y_next).any())
+        theta_logic = jnp.isnan(Y_next).any()
         r = Y_next[0]
         z = Y_next[1]
-        r_logic = jnp.logical_or(r <= 0.0, r >= 100000.0)
-        z_logic = jnp.logical_or(z <= 0.0, z >= 5000.0)
-        should_break = jnp.logical_or(r_logic, jnp.logical_or(z_logic, theta_logic))
+        top_z = ati(r)
+        bottom_z = bty(r)
+        r_logic = jnp.logical_or(r < 0.0, r >= 100000.0)
+        z_logic = jnp.logical_or(z < top_z - 1.0e-6, z > bottom_z + 1.0e-6)
+        backward_logic = jnp.logical_and(REFLECTION_MODEL["kill_backward_rays"], Y_next[2] < 0.0)
+        should_break = jnp.logical_or(backward_logic, jnp.logical_or(r_logic, jnp.logical_or(z_logic, theta_logic)))
         return jax.lax.cond(
             should_break,
             lambda _: (Y, Y),
@@ -365,13 +562,14 @@ def compute_multiple_ray_paths(
     omega = 2 * jnp.pi * freq
     delta_alpha = jnp.where(theta.shape[0] > 1, theta[1] - theta[0], 1.0)
     n_theta = len(theta)
-    Y0_set = jnp.zeros((n_theta, 9), dtype=jnp.float64)
+    Y0_set = jnp.zeros((n_theta, 13), dtype=jnp.float64)
     C0 = c(r_s, z_s)
     rho = jnp.cos(theta) / C0
     zeta = jnp.sin(theta) / C0
     epsilon = (2 * C0**2) / (omega * delta_alpha**2 + 1e-12)
-    q0_r = jnp.where(beam_type == 'geometric', 0.0, 0.0)
-    q0_i = jnp.where(beam_type == 'geometric', 0.0, epsilon)
+    bellhop_beam = jnp.logical_or(beam_type == 'bellhop', beam_type == 'geometric')
+    q0_r = 0.0
+    q0_i = jnp.where(bellhop_beam, 1.0, epsilon)
     p0_r = 1.0
     p0_i = 0.0
     tau_0 = 0.0
@@ -385,10 +583,33 @@ def compute_multiple_ray_paths(
     Y0_set = Y0_set.at[:, 6].set(p0_r) # p_r
     Y0_set = Y0_set.at[:, 7].set(p0_i) # p_i
     Y0_set = Y0_set.at[:, 8].set(tau_0) # tau
+    Y0_set = Y0_set.at[:, 9].set(0.0) # n_surface
+    Y0_set = Y0_set.at[:, 10].set(0.0) # n_bottom
+    Y0_set = Y0_set.at[:, 11].set(0.0) # log_amp
+    Y0_set = Y0_set.at[:, 12].set(0.0) # phase
 
-    stepper = RK2_stepper(ray_eqns, ds, ati=ati, bty=bty)
+    stepper = RK2_stepper(ray_eqns, ds, freq=freq, ati=ati, bty=bty)
     trj = jax.vmap(rollout(stepper, int(R_max / ds), include_init=True))(Y0_set)
     return trj
+
+
+def _segment_reflection_factor(
+    single_trj,
+    is_,
+    *,
+    surface_reflection_coeff=-1.0 + 0.0j,
+    bottom_reflection_coeff=1.0 + 0.0j,
+):
+    if single_trj.shape[1] >= 13:
+        return jnp.exp(single_trj[is_, 11] + 1j * single_trj[is_, 12])
+    if single_trj.shape[1] < 11:
+        return 1.0 + 0.0j
+
+    n_surface = single_trj[:, 9]
+    n_bottom = single_trj[:, 10]
+    surface_bounces = jnp.rint(n_surface[is_]).astype(jnp.int32)
+    bottom_bounces = jnp.rint(n_bottom[is_]).astype(jnp.int32)
+    return (surface_reflection_coeff ** surface_bounces) * (bottom_reflection_coeff ** bottom_bounces)
 
 def compute_caustic(ray_q: jnp.ndarray) -> jnp.ndarray:
     """
@@ -439,8 +660,19 @@ def bracket_indices(x_curr, x_next, r_grid):
     i2 = jnp.clip(i2, 0, N-1).astype(jnp.int32)
     return i1, i2
 
+
+def _resolve_run_mode(run_mode=None, coherent=None):
+    if run_mode is not None:
+        normalized = str(run_mode).strip().lower()
+        if normalized not in ("coherent", "incoherent", "semicoherent"):
+            raise ValueError("run_mode must be one of: coherent, incoherent, semicoherent.")
+        return normalized
+    if coherent is None:
+        return "coherent"
+    return "coherent" if coherent else "incoherent"
+
 @functools.partial(jax.jit, static_argnames=('RunTypeE',))
-def InfluenceGeoGaussian(freq, single_trj, z_s, delta_alpha, rr_grid, rz_grid, RunTypeE='S'):
+def InfluenceGeoGaussian(freq, single_trj, z_s, source_takeoff_angle, source_amplitude, delta_alpha, rr_grid, rz_grid, RunTypeE='S'):
     
     omega = 2 * jnp.pi * freq
     IBWin = 4
@@ -448,20 +680,21 @@ def InfluenceGeoGaussian(freq, single_trj, z_s, delta_alpha, rr_grid, rz_grid, R
     C =  c(single_trj[0, 0], single_trj[0, 1])
     q0  = C/ delta_alpha
     lambda_ = C / freq
-    Rat1 = 1 / jnp.sqrt(2 * jnp.pi)
+    launch_cosine = jnp.sqrt(jnp.maximum(jnp.abs(jnp.cos(source_takeoff_angle)), 1e-12))
+    Rat1 = jax.lax.cond(
+        REFLECTION_MODEL["source_type"] == "point",
+        lambda _: launch_cosine / jnp.sqrt(2 * jnp.pi),
+        lambda _: 1 / jnp.sqrt(2 * jnp.pi),
+        operand=None,
+    )
     Nsteps = single_trj.shape[0]
     Nrr = rr_grid.shape[0]
     Nrz = rz_grid.shape[0]
     
-    # ray_q = single_trj[:,4]
-    q_r = single_trj[:, 4]
-    q_i = single_trj[:, 5]
-    ray_q = q_r + 1j * q_i                 # complex q along ray
-    ray_q_re = jnp.real(ray_q)             # for sign checks only
+    ray_q = jnp.real(single_trj[:, 4])
 
     ray_x = jnp.real(single_trj[:, :2])
     ray_tau = jnp.real(single_trj[:, 8])
-    ray_Rfa = jnp.ones(Nsteps, dtype=jnp.float64)  # Placeholder for ray_Rfa, if needed.
     
     init_c = 1 + 0j
     init_U = jnp.zeros((Nrz, Nrr), dtype=jnp.complex128)
@@ -476,9 +709,9 @@ def InfluenceGeoGaussian(freq, single_trj, z_s, delta_alpha, rr_grid, rz_grid, R
         # crossed = ((ray_q[is_] <= 0) & (ray_q[is_-1] > 0)) | \
         #           ((ray_q[is_] >= 0) & (ray_q[is_-1] < 0))
         
-        crossed = ((ray_q_re[is_] <= 0) & (ray_q_re[is_-1] > 0)) | \
-                  ((ray_q_re[is_] >= 0) & (ray_q_re[is_-1] < 0))
-        caustic = jax.lax.cond(is_>0 & crossed, flip, lambda c: c, caustic)
+        crossed = ((ray_q[is_] <= 0) & (ray_q[is_-1] > 0)) | \
+                  ((ray_q[is_] >= 0) & (ray_q[is_-1] < 0))
+        caustic = jax.lax.cond((is_ > 0) & crossed, flip, lambda c: c, caustic)
 
         # --- bracket receiver ranges ---
         x_curr = ray_x[is_, 0]
@@ -528,52 +761,46 @@ def InfluenceGeoGaussian(freq, single_trj, z_s, delta_alpha, rr_grid, rz_grid, R
                 # sigma = jnp.where(sigma < sigma_lim, sigma_lim, sigma)
                 
                 # interpolated complex q and beam radius sigma
-                q_seg = ray_q[is_] + s * (ray_q[is_+1] - ray_q[is_])   # complex
-                sigma = jnp.abs(q_seg) / (q0 + 1e-12)                 # q0 from line 331 (scalar)
+                q_seg = ray_q[is_] + s * (ray_q[is_+1] - ray_q[is_])
+                sigma = jnp.abs(q_seg) / (q0 + 1e-12)
                 sigma_lim = jnp.minimum(0.2 * freq * ray_tau[is_] / lambda_, jnp.pi * lambda_)
                 sigma = jnp.where(sigma < sigma_lim, sigma_lim, sigma)
 
                 # select depth‑indices where beam contributes
                 mask = n < IBWin * sigma
-                irz = jnp.nonzero(mask, size=Nrz)[0]  # padded with zeros if empty
 
                 def no_contrib(Uc):
                     return Uc
 
                 def contrib(Uc):
-                    # A = jnp.abs(q0 / q_i[irz])
-                    A = jnp.abs(q0 / (q_seg[irz] + 1e-12))
-                    delay = ray_tau[is_] + s[irz] * (ray_tau[is_+1] - ray_tau[is_])
+                    A = jnp.abs(q0 / (q_seg + 1e-12))
+                    delay = ray_tau[is_] + s * (ray_tau[is_+1] - ray_tau[is_])
 
                     # caustic phase per sub‐beam
-                    caust = caustic_loc * jnp.ones_like(irz, dtype=jnp.complex64)
-                    # flip_sub = ((q_i[irz] <= 0) & (ray_q[is_] > 0)) | \
-                    #            ((q_i[irz] >= 0) & (ray_q[is_] < 0))
-                    
-                    q_seg_re = jnp.real(q_seg)
-                    flip_sub = ((q_seg_re[irz] <= 0) & (ray_q_re[is_] > 0)) | \
-                            ((q_seg_re[irz] >= 0) & (ray_q_re[is_] < 0))
-                            
+                    caust = caustic_loc * jnp.ones_like(q_seg, dtype=jnp.complex128)
+                    flip_sub = ((q_seg <= 0) & (ray_q[is_] > 0)) | ((q_seg >= 0) & (ray_q[is_] < 0))
                     caust = jnp.where(flip_sub, 1j * caust, caust)
-
-                    # const = (Rat1 * ray_Rfa[is_] *
-                            #  jnp.sqrt(c(ray_x[is_, 0], ray_x[is_, 1]) / jnp.abs(q_i[irz])) *
-                            #  caust)
-                            
-                    const = (Rat1 * ray_Rfa[is_] *jnp.sqrt(c(ray_x[is_, 0], ray_x[is_, 1]) / (jnp.abs(q_seg[irz]) + 1e-12)) *caust)
+                    const = (
+                        source_amplitude
+                        * Rat1
+                        * jnp.sqrt(c(ray_x[is_, 0], ray_x[is_, 1]) / (jnp.abs(q_seg) + 1e-12))
+                        * caust
+                    )
+                    const = const * _segment_reflection_factor(single_trj, is_)
 
                     if RunTypeE == 'S':
                         const = DS * const
 
-                    amp = const * jnp.exp(-0.5 * (n[irz] / sigma[irz])**2) / (sigma[irz] * A)
+                    amp = const * jnp.exp(-0.5 * (n / sigma)**2) / (sigma * A)
 
                     if RunTypeE == 'C':  # coherent TL
                         contri = amp * jnp.exp(-1j * 2*jnp.pi*freq * delay)
-                        return Uc.at[irz, ir].add(contri)
+                        return Uc.at[:, ir].add(jnp.where(mask, contri, 0.0 + 0.0j))
                     else:               # incoherent / semi‐coherent
-                        W = jnp.exp(-0.5 * (n[irz]/sigma[irz])**2) / (2.*sigma[irz]*A)
-                        contri = (jnp.abs(amp) * jnp.exp(2*jnp.pi*freq * jnp.imag(delay)) / W)**2 * W
-                        return Uc.at[irz, ir].add(contri)
+                        W = jnp.exp(-0.5 * (n / sigma)**2) / (2.*sigma*A)
+                        W_safe = jnp.where(mask, W, 1.0)
+                        contri = (jnp.abs(amp) * jnp.exp(2*jnp.pi*freq * jnp.imag(delay)) / W_safe)**2 * W_safe
+                        return Uc.at[:, ir].add(jnp.where(mask, contri + 0.0j, 0.0 + 0.0j))
 
                 return jax.lax.cond(mask.any(), contrib, no_contrib, U_inner)
             
@@ -594,6 +821,119 @@ def InfluenceGeoGaussian(freq, single_trj, z_s, delta_alpha, rr_grid, rz_grid, R
     return final_U
 
 
+@functools.partial(jax.jit, static_argnames=('RunTypeE',))
+def InfluenceGeoHat(freq, single_trj, z_s, source_takeoff_angle, source_amplitude, delta_alpha, rr_grid, rz_grid, RunTypeE='S'):
+    omega = 2 * jnp.pi * freq
+    DS = jnp.sqrt(2.0) * jnp.sin(omega * z_s * single_trj[0, 3])
+    C = c(single_trj[0, 0], single_trj[0, 1])
+    q0 = C / delta_alpha
+    Rat1 = jax.lax.cond(
+        REFLECTION_MODEL["source_type"] == "point",
+        lambda _: jnp.sqrt(jnp.maximum(jnp.abs(jnp.cos(source_takeoff_angle)), 1e-12)),
+        lambda _: 1.0,
+        operand=None,
+    )
+
+    n_steps = single_trj.shape[0]
+    n_rr = rr_grid.shape[0]
+    n_rz = rz_grid.shape[0]
+    ray_q = jnp.real(single_trj[:, 4])
+    ray_tau = jnp.real(single_trj[:, 8])
+    ray_x = jnp.real(single_trj[:, :2])
+
+    init_c = 1.0 + 0.0j
+    init_u = jnp.zeros((n_rz, n_rr), dtype=jnp.complex128)
+
+    def body_is(carry, is_):
+        caustic, field = carry
+
+        crossed = ((ray_q[is_] <= 0.0) & (ray_q[is_ - 1] > 0.0)) | ((ray_q[is_] >= 0.0) & (ray_q[is_ - 1] < 0.0))
+        caustic = jax.lax.cond(is_ > 0, lambda c0: jnp.where(crossed, 1j * c0, c0), lambda c0: c0, caustic)
+
+        x_curr = ray_x[is_, 0]
+        x_next = ray_x[is_ + 1, 0]
+        ir1, ir2 = bracket_indices(x_curr, x_next, rr_grid)
+
+        def no_op(state):
+            return state
+
+        def process_ranges(state):
+            caustic_loc, field_loc = state
+            c_curr = c(ray_x[is_, 0], ray_x[is_, 1])
+            tray = ray_x[is_ + 1] - ray_x[is_]
+            rlen = jnp.linalg.norm(tray) + 1e-12
+            tray = tray / rlen
+            tray_scaled = tray / rlen
+            nray = jnp.array([-tray[1], tray[0]])
+
+            def body_ir(ir, field_inner):
+                xrcvr = jnp.stack([jnp.full_like(rz_grid, rr_grid[ir]), rz_grid], axis=-1)
+                delta = xrcvr - ray_x[is_]
+                s = delta @ tray_scaled
+                n = jnp.abs(delta @ nray)
+
+                q = ray_q[is_] + s * (ray_q[is_ + 1] - ray_q[is_])
+                rad_max = jnp.abs(q / (q0 + 1e-12))
+                mask = n < rad_max
+
+                def no_contrib(fc):
+                    return fc
+
+                def add_contrib(fc):
+                    A = 1.0 / (rad_max + 1e-12)
+                    delay = ray_tau[is_] + s * (ray_tau[is_ + 1] - ray_tau[is_])
+                    caust = caustic_loc * jnp.ones_like(q, dtype=jnp.complex128)
+                    flip_sub = ((q <= 0.0) & (ray_q[is_] > 0.0)) | ((q >= 0.0) & (ray_q[is_] < 0.0))
+                    caust = jnp.where(flip_sub, 1j * caust, caust)
+                    const = source_amplitude * Rat1 * jnp.sqrt(c_curr / (jnp.abs(q) + 1e-12)) * A * caust
+                    const = const * _segment_reflection_factor(single_trj, is_)
+                    const = jax.lax.cond(RunTypeE == 'S', lambda cc: DS * cc, lambda cc: cc, const)
+                    amp = const * (rad_max - n)
+
+                    if RunTypeE == 'C':
+                        contri = amp * jnp.exp(-1j * omega * delay)
+                        return fc.at[:, ir].add(jnp.where(mask, contri, 0.0 + 0.0j))
+
+                    W = (rad_max - n) / (rad_max + 1e-12)
+                    W_safe = jnp.where(mask, W, 1.0)
+                    contri = (jnp.abs(amp) * jnp.exp(omega * jnp.imag(delay)) / (W_safe + 1e-12)) ** 2 * W_safe
+                    return fc.at[:, ir].add(jnp.where(mask, contri + 0.0j, 0.0 + 0.0j))
+
+                return jax.lax.cond(jnp.any(mask), add_contrib, no_contrib, field_inner)
+
+            field_loc = jax.lax.fori_loop(ir1, ir2 + 1, body_ir, field_loc)
+            return caustic_loc, field_loc
+
+        active = _segment_alive(single_trj, is_)
+        should_process = jnp.logical_and(active, ir2 >= ir1)
+        return jax.lax.cond(should_process, process_ranges, no_op, (caustic, field)), None
+
+    (_, final_u), _ = jax.lax.scan(body_is, (init_c, init_u), jnp.arange(n_steps - 1))
+    return final_u
+
+
+@functools.partial(jax.jit, static_argnames=('run_mode', 'line_source'))
+def scale_pressure_bellhop(freq, delta_alpha, c0, rr_grid, field, run_mode='coherent', line_source=False):
+    coherent = run_mode == 'coherent'
+    const = jax.lax.cond(
+        coherent,
+        lambda _: -delta_alpha * jnp.sqrt(freq) / (c0 + 1e-12),
+        lambda _: -1.0,
+        operand=None,
+    )
+    safe_r = jnp.maximum(rr_grid, 1e-12)
+    scaled = field
+    if not coherent:
+        scaled = jnp.sqrt(jnp.maximum(jnp.real(scaled), 0.0)) + 0.0j
+    factor = jax.lax.cond(
+        line_source,
+        lambda _: -4.0 * jnp.sqrt(jnp.pi) * const * jnp.ones_like(rr_grid),
+        lambda _: jnp.where(rr_grid > 0.0, const / jnp.sqrt(safe_r), 0.0),
+        operand=None,
+    )
+    return scaled * factor[None, :]
+
+
 def _segment_alive(single_trj, is_):
     curr = single_trj[is_]
     nxt = single_trj[is_ + 1]
@@ -607,6 +947,7 @@ def accumulate_geometric_gaussian_field(
     freq,
     single_trj,
     source_takeoff_angle,
+    source_amplitude,
     delta_alpha,
     rr_grid,
     rz_grid,
@@ -681,7 +1022,7 @@ def accumulate_geometric_gaussian_field(
 
                 def add_contrib(field_current):
                     range_safe = jnp.maximum(rr_grid[ir], 1.0)
-                    amp0 = (1.0 / jnp.sqrt(2.0 * jnp.pi)) * caustic_loc
+                    amp0 = source_amplitude * (1.0 / jnp.sqrt(2.0 * jnp.pi)) * caustic_loc
                     amp0 = amp0 * jnp.sqrt(cos_alpha * c_curr / (range_safe * (jnp.abs(q_interp) + 1e-12)))
                     shape = jnp.exp(-0.5 * (n_local / width_eff) ** 2)
                     phase = jnp.exp(-1j * omega * tau_interp)
@@ -716,13 +1057,31 @@ def trace_beam_fan(
     R_max=100000.0,
     Z_max=5000.0,
     beam_type='geometric',
+    auto_beam_count=False,
+    source_beam_pattern_angles_deg=None,
+    source_beam_pattern_db=None,
     ati=ati,
     bty=bty,
 ):
     """
     Trace a launch fan suitable for Bellhop-style beam summation.
     """
-    theta = jnp.linspace(theta_min, theta_max, n_beams, dtype=jnp.float64)
+    c0 = c(r_s, z_s)
+    n_beams_eff = jax.lax.cond(
+        auto_beam_count,
+        lambda _: bellhop_recommended_nbeams(freq, c0, R_max, theta_min, theta_max),
+        lambda _: jnp.asarray(n_beams, dtype=jnp.int32),
+        operand=None,
+    )
+    theta = jnp.linspace(theta_min, theta_max, n_beams_eff, dtype=jnp.float64)
+    source_amplitudes = evaluate_source_beam_pattern(theta, source_beam_pattern_angles_deg, source_beam_pattern_db)
+    weights = jnp.ones_like(theta)
+    weights = jax.lax.cond(
+        theta.shape[0] > 1,
+        lambda w: w.at[0].set(0.5).at[-1].set(0.5),
+        lambda w: w,
+        weights,
+    )
     trj_set = compute_multiple_ray_paths(
         freq,
         r_s,
@@ -735,7 +1094,7 @@ def trace_beam_fan(
         bty=bty,
         beam_type=beam_type,
     )
-    return theta, trj_set
+    return theta, weights, source_amplitudes, trj_set
 
 
 def solve_transmission_loss(
@@ -751,7 +1110,12 @@ def solve_transmission_loss(
     ds=10.0,
     beam_type='geometric',
     coherent=True,
+    run_mode=None,
     min_width_wavelengths=0.5,
+    accumulation_model='bellhop',
+    auto_beam_count=False,
+    source_beam_pattern_angles_deg=None,
+    source_beam_pattern_db=None,
     ati=ati,
     bty=bty,
 ):
@@ -761,7 +1125,9 @@ def solve_transmission_loss(
     Returns a dictionary containing the launch angles, traced trajectories,
     complex (or intensity-like) field, and TL in dB.
     """
-    theta, trj_set = trace_beam_fan(
+    run_mode = _resolve_run_mode(run_mode, coherent)
+
+    theta, launch_weights, source_amplitudes, trj_set = trace_beam_fan(
         freq,
         r_s,
         z_s,
@@ -772,6 +1138,9 @@ def solve_transmission_loss(
         R_max=float(rr_grid[-1]),
         Z_max=float(rz_grid[-1]),
         beam_type=beam_type,
+        auto_beam_count=auto_beam_count,
+        source_beam_pattern_angles_deg=source_beam_pattern_angles_deg,
+        source_beam_pattern_db=source_beam_pattern_db,
         ati=ati,
         bty=bty,
     )
@@ -780,45 +1149,258 @@ def solve_transmission_loss(
     wavelength = c0 / freq
     min_width_m = min_width_wavelengths * wavelength
 
-    if beam_type == 'geometric':
+    if accumulation_model == 'gaussian':
         beam_solver = jax.vmap(
-            lambda trj, launch_angle: accumulate_geometric_gaussian_field(
+            lambda trj, launch_angle, source_amplitude: InfluenceGeoGaussian(
+                freq,
+                trj,
+                z_s,
+                launch_angle,
+                source_amplitude,
+                delta_alpha,
+                rr_grid,
+                rz_grid,
+                RunTypeE='C' if run_mode == 'coherent' else 'S',
+            ),
+            in_axes=(0, 0, 0),
+        )
+    elif accumulation_model == 'hat':
+        beam_solver = jax.vmap(
+            lambda trj, launch_angle, source_amplitude: InfluenceGeoHat(
+                freq,
+                trj,
+                z_s,
+                launch_angle,
+                source_amplitude,
+                delta_alpha,
+                rr_grid,
+                rz_grid,
+                RunTypeE='C' if run_mode == 'coherent' else 'S',
+            ),
+            in_axes=(0, 0, 0),
+        )
+    elif beam_type == 'geometric':
+        beam_solver = jax.vmap(
+            lambda trj, launch_angle, source_amplitude: accumulate_geometric_gaussian_field(
                 freq,
                 trj,
                 launch_angle,
+                source_amplitude,
                 delta_alpha,
                 rr_grid,
                 rz_grid,
                 min_width_m,
-                coherent=coherent,
+                coherent=run_mode == 'coherent',
             ),
-            in_axes=(0, 0),
+            in_axes=(0, 0, 0),
         )
     else:
         beam_solver = jax.vmap(
-            lambda trj, _: InfluenceGeoGaussian(
+            lambda trj, launch_angle, source_amplitude: InfluenceGeoGaussian(
                 freq,
                 trj,
                 z_s,
+                launch_angle,
+                source_amplitude,
                 delta_alpha,
                 rr_grid,
                 rz_grid,
-                RunTypeE='C' if coherent else 'S',
+                RunTypeE='C' if run_mode == 'coherent' else 'S',
             ),
-            in_axes=(0, 0),
+            in_axes=(0, 0, 0),
         )
 
-    field_per_beam = beam_solver(trj_set, theta)
-    field_total = jnp.sum(field_per_beam, axis=0)
-    energy = jnp.abs(field_total) if coherent else jnp.sqrt(jnp.maximum(jnp.real(field_total), 0.0))
+    field_per_beam = beam_solver(trj_set, theta, source_amplitudes)
+    bellhop_style = accumulation_model in ('hat', 'gaussian')
+    field_per_beam = jax.lax.cond(
+        bellhop_style,
+        lambda fpb: fpb,
+        lambda fpb: fpb * launch_weights[:, None, None],
+        field_per_beam,
+    )
+    field_total_raw = jnp.sum(field_per_beam, axis=0)
+    field_total = scale_pressure_bellhop(freq, delta_alpha, c0, rr_grid, field_total_raw, run_mode=run_mode)
+    energy = jnp.abs(field_total)
     tl_db = -20.0 * jnp.log10(energy + 1e-16)
 
     return {
         'theta': theta,
+        'launch_weights': launch_weights,
+        'source_amplitudes': source_amplitudes,
+        'run_mode': run_mode,
+        'n_beams_recommended': bellhop_recommended_nbeams(freq, c0, float(rr_grid[-1]), theta_min, theta_max),
         'trajectories': trj_set,
         'field_per_beam': field_per_beam,
+        'field_total_raw': field_total_raw,
         'field_total': field_total,
         'tl_db': tl_db,
+    }
+
+
+def _smooth_segment_window(rr_grid, x0, x1, softness_m):
+    x_lo = jnp.minimum(x0, x1)
+    x_hi = jnp.maximum(x0, x1)
+    left = jax.nn.sigmoid((rr_grid - x_lo) / (softness_m + 1e-12))
+    right = jax.nn.sigmoid((x_hi - rr_grid) / (softness_m + 1e-12))
+    return left * right
+
+
+@functools.partial(jax.jit, static_argnames=("run_mode",))
+def accumulate_geometric_gaussian_field_autodiff(
+    freq,
+    single_trj,
+    source_takeoff_angle,
+    source_amplitude,
+    delta_alpha,
+    rr_grid,
+    rz_grid,
+    min_width_m,
+    range_window_softness_m,
+    run_mode="coherent",
+):
+    omega = 2.0 * jnp.pi * freq
+    c0 = c(single_trj[0, 0], single_trj[0, 1])
+    cos_alpha = jnp.maximum(jnp.cos(source_takeoff_angle), 1e-12)
+    ray_q = jnp.real(single_trj[:, 4])
+    ray_tau = jnp.real(single_trj[:, 8])
+    ray_x = jnp.real(single_trj[:, :2])
+    n_steps = single_trj.shape[0]
+    rr_mat = jnp.broadcast_to(rr_grid[None, :], (rz_grid.shape[0], rr_grid.shape[0]))
+    rz_mat = jnp.broadcast_to(rz_grid[:, None], (rz_grid.shape[0], rr_grid.shape[0]))
+    coherent = run_mode == "coherent"
+
+    def body_fn(carry, is_):
+        field, caustic = carry
+        curr = ray_x[is_]
+        nxt = ray_x[is_ + 1]
+        delta = nxt - curr
+        seg_len = jnp.linalg.norm(delta) + 1e-12
+        t_hat = delta / seg_len
+        t_scaled = t_hat / seg_len
+        n_hat = jnp.array([-t_hat[1], t_hat[0]])
+
+        crossed = jnp.logical_or(
+            jnp.logical_and(ray_q[is_] <= 0.0, ray_q[jnp.maximum(is_ - 1, 0)] > 0.0),
+            jnp.logical_and(ray_q[is_] >= 0.0, ray_q[jnp.maximum(is_ - 1, 0)] < 0.0),
+        )
+        caustic = jax.lax.cond(is_ > 0, lambda c: jnp.where(crossed, 1j * c, c), lambda c: c, caustic)
+
+        delta_r = rr_mat - curr[0]
+        delta_z = rz_mat - curr[1]
+        s_local = delta_r * t_scaled[0] + delta_z * t_scaled[1]
+        n_local = delta_r * n_hat[0] + delta_z * n_hat[1]
+
+        q_interp = ray_q[is_] + s_local * (ray_q[is_ + 1] - ray_q[is_])
+        tau_interp = ray_tau[is_] + s_local * (ray_tau[is_ + 1] - ray_tau[is_])
+        width = jnp.abs(q_interp) * delta_alpha / (c0 + 1e-12)
+        width_eff = jnp.maximum(width, min_width_m)
+        range_weight = _smooth_segment_window(rr_grid, curr[0], nxt[0], range_window_softness_m)[None, :]
+
+        amp0 = source_amplitude * (1.0 / jnp.sqrt(2.0 * jnp.pi)) * caustic
+        amp0 = amp0 * jnp.sqrt(cos_alpha * c(curr[0], curr[1]) / (jnp.maximum(rr_mat, 1.0) * (jnp.abs(q_interp) + 1e-12)))
+        amp0 = amp0 * _segment_reflection_factor(single_trj, is_)
+        shape = jnp.exp(-0.5 * (n_local / width_eff) ** 2)
+        phase = jnp.exp(-1j * omega * tau_interp)
+        contrib = amp0 * shape * phase * range_weight
+
+        field = jax.lax.cond(
+            coherent,
+            lambda fld: fld + contrib,
+            lambda fld: fld + (jnp.abs(contrib) ** 2 + 0.0j),
+            field,
+        )
+        return (field, caustic), None
+
+    init_field = jnp.zeros((rz_grid.shape[0], rr_grid.shape[0]), dtype=jnp.complex128)
+    (field, _), _ = jax.lax.scan(body_fn, (init_field, 1.0 + 0.0j), jnp.arange(n_steps - 1))
+    return field
+
+
+def solve_transmission_loss_autodiff(
+    freq,
+    r_s,
+    z_s,
+    theta_min,
+    theta_max,
+    n_beams,
+    rr_grid,
+    rz_grid,
+    *,
+    ds=10.0,
+    beam_type="geometric",
+    run_mode="coherent",
+    auto_beam_count=False,
+    min_width_wavelengths=0.5,
+    range_window_softness_m=None,
+    source_beam_pattern_angles_deg=None,
+    source_beam_pattern_db=None,
+    ati=ati,
+    bty=bty,
+):
+    """
+    Autodiff-safe Gaussian-beam TL solver for SciML workflows.
+
+    This path avoids discrete receiver bracketing and hard receiver masks by
+    using smooth segment windows and full-grid Gaussian influence evaluation.
+    It is intended for gradient-based inversion/training workloads.
+    """
+    run_mode = _resolve_run_mode(run_mode, None)
+    theta, launch_weights, source_amplitudes, trj_set = trace_beam_fan(
+        freq,
+        r_s,
+        z_s,
+        theta_min,
+        theta_max,
+        n_beams,
+        ds=ds,
+        R_max=rr_grid[-1],
+        Z_max=rz_grid[-1],
+        beam_type=beam_type,
+        auto_beam_count=auto_beam_count,
+        source_beam_pattern_angles_deg=source_beam_pattern_angles_deg,
+        source_beam_pattern_db=source_beam_pattern_db,
+        ati=ati,
+        bty=bty,
+    )
+    c0 = c(r_s, z_s)
+    delta_alpha = jnp.where(theta.shape[0] > 1, theta[1] - theta[0], 1.0)
+    wavelength = c0 / freq
+    min_width_m = min_width_wavelengths * wavelength
+    if range_window_softness_m is None:
+        range_window_softness_m = jnp.maximum(ds, (rr_grid[-1] - rr_grid[0]) / jnp.maximum(rr_grid.shape[0] - 1, 1))
+
+    beam_solver = jax.vmap(
+        lambda trj, launch_angle, source_amplitude: accumulate_geometric_gaussian_field_autodiff(
+            freq,
+            trj,
+            launch_angle,
+            source_amplitude,
+            delta_alpha,
+            rr_grid,
+            rz_grid,
+            min_width_m,
+            range_window_softness_m,
+            run_mode=run_mode,
+        ),
+        in_axes=(0, 0, 0),
+    )
+
+    field_per_beam = beam_solver(trj_set, theta, source_amplitudes) * launch_weights[:, None, None]
+    field_total_raw = jnp.sum(field_per_beam, axis=0)
+    field_total = scale_pressure_bellhop(freq, delta_alpha, c0, rr_grid, field_total_raw, run_mode=run_mode)
+    energy = jnp.abs(field_total)
+    tl_db = -20.0 * jnp.log10(energy + 1e-16)
+
+    return {
+        "theta": theta,
+        "launch_weights": launch_weights,
+        "source_amplitudes": source_amplitudes,
+        "run_mode": run_mode,
+        "trajectories": trj_set,
+        "field_per_beam": field_per_beam,
+        "field_total_raw": field_total_raw,
+        "field_total": field_total,
+        "tl_db": tl_db,
     }
 
 

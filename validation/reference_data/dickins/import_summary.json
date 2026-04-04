@@ -1,0 +1,13 @@
+{
+  "case": "dickins",
+  "source_shd": "/home/indu/MELO/OALIB_AcousticToolBox/at/tests/Dickins/DickinsB.shd",
+  "title": "BELLHOP- Dickins seamount; unit density",
+  "plot_type": "rectilin",
+  "rr_count": 1001,
+  "rz_count": 601,
+  "tl_shape": [
+    601,
+    1001
+  ],
+  "frequency_hz": 230.0
+}

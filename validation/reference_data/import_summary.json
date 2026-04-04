@@ -1,0 +1,28 @@
+[
+  {
+    "case": "munk",
+    "source_shd": "/home/indu/MELO/OALIB_AcousticToolBox/at/tests/Munk/MunkB_Coh.shd",
+    "title": "BELLHOP- Munk profile, coherent",
+    "plot_type": "rectilin",
+    "rr_count": 1001,
+    "rz_count": 501,
+    "tl_shape": [
+      501,
+      1001
+    ],
+    "frequency_hz": 50.0
+  },
+  {
+    "case": "dickins",
+    "source_shd": "/home/indu/MELO/OALIB_AcousticToolBox/at/tests/Dickins/DickinsB.shd",
+    "title": "BELLHOP- Dickins seamount; unit density",
+    "plot_type": "rectilin",
+    "rr_count": 1001,
+    "rz_count": 601,
+    "tl_shape": [
+      601,
+      1001
+    ],
+    "frequency_hz": 230.0
+  }
+]
