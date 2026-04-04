@@ -2,6 +2,7 @@
 import matplotlib.pyplot as plt
 import jax.numpy as jnp
 import jax
+import numpy as np
 import sys
 import os
 
@@ -15,6 +16,179 @@ from sound_speed import c
 
 # Specify the color to match Bellhop
 earthbrown = (0.5, 0.3, 0.1)
+
+
+def bellhop_tl_color_limits(tl_db):
+    tl = np.asarray(tl_db, dtype=float)
+    tl = np.where(np.isfinite(tl), tl, np.nan)
+    valid = tl[np.isfinite(tl)]
+    if valid.size == 0:
+        return 50.0, 100.0
+
+    tlmed = float(np.median(valid))
+    tlstd = float(np.std(valid))
+    tlmax = 10.0 * round((tlmed + 0.75 * tlstd) / 10.0)
+    tlmin = tlmax - 50.0
+    if not np.isfinite(tlmin) or not np.isfinite(tlmax) or tlmax <= tlmin:
+        return 50.0, 100.0
+    return tlmin, tlmax
+
+
+def _format_plotshd_title(title=None, freq_hz=None, source_depth_m=None):
+    title_lines = []
+    if title:
+        title_lines.append(str(title).replace("_", " "))
+    meta = []
+    if freq_hz is not None:
+        meta.append(f"Freq = {float(freq_hz):g} Hz")
+    if source_depth_m is not None:
+        meta.append(f"z_src = {float(source_depth_m):g} m")
+    if meta:
+        title_lines.append("    ".join(meta))
+    return "\n".join(title_lines) if title_lines else None
+
+
+def plot_tl_field(
+    rr_grid_m,
+    rz_grid_m,
+    tl_db,
+    *,
+    ax=None,
+    title=None,
+    freq_hz=None,
+    source_depth_m=None,
+    units="km",
+    cmap="jet_r",
+    tl_limits=None,
+    add_colorbar=True,
+    colorbar_label="TL (dB)",
+):
+    rr_grid_m = np.asarray(rr_grid_m, dtype=float)
+    rz_grid_m = np.asarray(rz_grid_m, dtype=float)
+    tl_db = np.asarray(tl_db, dtype=float)
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(12, 5))
+
+    if units == "km":
+        rr_plot = rr_grid_m / 1000.0
+        xlab = "Range (km)"
+    else:
+        rr_plot = rr_grid_m
+        xlab = "Range (m)"
+
+    plot_title = _format_plotshd_title(title=title, freq_hz=freq_hz, source_depth_m=source_depth_m)
+
+    if tl_limits is None:
+        tl_limits = bellhop_tl_color_limits(tl_db)
+    vmin, vmax = tl_limits
+
+    if tl_db.ndim != 2:
+        raise ValueError(f"Expected a 2D TL field, got shape {tl_db.shape}")
+
+    if tl_db.shape[0] > 1 and tl_db.shape[1] > 1:
+        mesh = ax.pcolormesh(
+            rr_plot,
+            rz_grid_m,
+            tl_db,
+            shading="nearest",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+        )
+        ax.set_xlabel(xlab)
+        ax.set_ylabel("Depth (m)")
+        ax.set_title(plot_title)
+        ax.invert_yaxis()
+        ax.tick_params(direction="out")
+        if add_colorbar:
+            cbar = plt.colorbar(mesh, ax=ax, label=colorbar_label)
+            cbar.ax.tick_params(direction="out")
+        return ax
+
+    if tl_db.shape[0] == 1:
+        ax.plot(rr_plot, tl_db[0], linewidth=2.0)
+        ax.set_xlabel(xlab)
+        ax.set_ylabel("TL (dB)")
+        ax.set_title(plot_title)
+        ax.invert_yaxis()
+        ax.tick_params(direction="out")
+        return ax
+
+    ax.plot(tl_db[:, 0], rz_grid_m, linewidth=2.0)
+    ax.set_xlabel("TL (dB)")
+    ax.set_ylabel("Depth (m)")
+    ax.set_title(plot_title)
+    ax.invert_yaxis()
+    ax.invert_xaxis()
+    ax.tick_params(direction="out")
+    return ax
+
+
+def plot_tl_comparison(
+    rr_grid_m,
+    rz_grid_m,
+    reference_tl_db,
+    solver_tl_db,
+    *,
+    fig=None,
+    axes=None,
+    title_prefix=None,
+    freq_hz=None,
+    source_depth_m=None,
+    units="km",
+):
+    reference_tl_db = np.asarray(reference_tl_db, dtype=float)
+    solver_tl_db = np.asarray(solver_tl_db, dtype=float)
+    tl_limits = bellhop_tl_color_limits(reference_tl_db)
+    diff = solver_tl_db - reference_tl_db
+    diff_lim = float(np.nanmax(np.abs(diff))) if np.isfinite(diff).any() else 1.0
+    if diff_lim == 0.0:
+        diff_lim = 1.0
+
+    if fig is None or axes is None:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    prefix = f"{title_prefix}: " if title_prefix else ""
+
+    plot_tl_field(
+        rr_grid_m,
+        rz_grid_m,
+        reference_tl_db,
+        ax=axes[0],
+        title=f"{prefix}Bellhop TL",
+        freq_hz=freq_hz,
+        source_depth_m=source_depth_m,
+        units=units,
+        tl_limits=tl_limits,
+        add_colorbar=True,
+    )
+    plot_tl_field(
+        rr_grid_m,
+        rz_grid_m,
+        solver_tl_db,
+        ax=axes[1],
+        title=f"{prefix}JAX TL",
+        freq_hz=freq_hz,
+        source_depth_m=source_depth_m,
+        units=units,
+        tl_limits=tl_limits,
+        add_colorbar=True,
+    )
+    plot_tl_field(
+        rr_grid_m,
+        rz_grid_m,
+        diff,
+        ax=axes[2],
+        title=f"{prefix}Difference (JAX - Bellhop)",
+        freq_hz=freq_hz,
+        source_depth_m=source_depth_m,
+        units=units,
+        cmap="coolwarm",
+        tl_limits=(-diff_lim, diff_lim),
+        add_colorbar=True,
+        colorbar_label="TL Difference (dB)",
+    )
+    return fig, axes
 
 def plot_environment(R_max, r_src, z_src, fig=None, ax=None, plot_src=True,
                      x_lim=None, y_lim=None, bty=bty, ati=ati,

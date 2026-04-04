@@ -543,6 +543,96 @@ def compute_single_ray_path(freq, r_s, z_s, theta_0, delta_alpha_opt, ray_eqns=d
     trj = rollout(stepper, num_steps, include_init=True)(Y0)
     return trj
 
+
+def _initialize_ray_fan_state(freq, r_s, z_s, theta, *, beam_type='paraxial'):
+    omega = 2 * jnp.pi * freq
+    delta_alpha = jnp.where(theta.shape[0] > 1, theta[1] - theta[0], 1.0)
+    n_theta = len(theta)
+    Y0_set = jnp.zeros((n_theta, 13), dtype=jnp.float64)
+    C0 = c(r_s, z_s)
+    rho = jnp.cos(theta) / C0
+    zeta = jnp.sin(theta) / C0
+    epsilon = (2 * C0**2) / (omega * delta_alpha**2 + 1e-12)
+    bellhop_beam = jnp.logical_or(beam_type == 'bellhop', beam_type == 'geometric')
+    q0_r = 0.0
+    q0_i = jnp.where(bellhop_beam, 1.0, epsilon)
+    p0_r = 1.0
+    p0_i = 0.0
+    tau_0 = 0.0
+
+    Y0_set = Y0_set.at[:, 0].set(r_s)
+    Y0_set = Y0_set.at[:, 1].set(z_s)
+    Y0_set = Y0_set.at[:, 2].set(rho)
+    Y0_set = Y0_set.at[:, 3].set(zeta)
+    Y0_set = Y0_set.at[:, 4].set(q0_r)
+    Y0_set = Y0_set.at[:, 5].set(q0_i)
+    Y0_set = Y0_set.at[:, 6].set(p0_r)
+    Y0_set = Y0_set.at[:, 7].set(p0_i)
+    Y0_set = Y0_set.at[:, 8].set(tau_0)
+    Y0_set = Y0_set.at[:, 9].set(0.0)
+    Y0_set = Y0_set.at[:, 10].set(0.0)
+    Y0_set = Y0_set.at[:, 11].set(0.0)
+    Y0_set = Y0_set.at[:, 12].set(0.0)
+    return Y0_set
+
+
+def rollout_batched(stepper, n, *, include_init: bool = True):
+    batched_step = jax.jit(jax.vmap(lambda y: stepper(y), in_axes=0, out_axes=0))
+
+    def scan_fn(carry, _):
+        Y_batch, active = carry
+        Y_next_all = batched_step(Y_batch)
+
+        r = Y_next_all[:, 0]
+        z = Y_next_all[:, 1]
+        top_z = jax.vmap(stepper.ati)(r)
+        bottom_z = jax.vmap(stepper.bty)(r)
+        nan_logic = jnp.any(jnp.isnan(Y_next_all), axis=1)
+        r_logic = jnp.logical_or(r < 0.0, r >= 100000.0)
+        z_logic = jnp.logical_or(z < top_z - 1.0e-6, z > bottom_z + 1.0e-6)
+        backward_logic = jnp.logical_and(REFLECTION_MODEL["kill_backward_rays"], Y_next_all[:, 2] < 0.0)
+        should_break = jnp.logical_and(active, jnp.logical_or(backward_logic, jnp.logical_or(r_logic, jnp.logical_or(z_logic, nan_logic))))
+
+        next_active = jnp.logical_and(active, jnp.logical_not(should_break))
+        Y_next = jnp.where((active[:, None]), Y_next_all, Y_batch)
+        Y_next = jnp.where(should_break[:, None], Y_batch, Y_next)
+        return (Y_next, next_active), Y_next
+
+    def rollout_fn(Y0_batch):
+        init_active = jnp.ones((Y0_batch.shape[0],), dtype=bool)
+        (_, _), trj = jax.lax.scan(scan_fn, (Y0_batch, init_active), None, length=n)
+        if include_init:
+            return jnp.concatenate([Y0_batch[None, :, :], trj], axis=0)
+        return trj
+
+    return rollout_fn
+
+
+def compute_multiple_ray_paths_batched(
+    freq,
+    r_s,
+    z_s,
+    theta,
+    ray_eqns=dynamic_ray_eqns,
+    ds=10.0,
+    R_max=100000,
+    Z_max=5000,
+    ati=None,
+    bty=None,
+    beam_type='paraxial',
+):
+    """
+    HPC-oriented batched tracer.
+
+    This updates the full ray fan as one contiguous tensor with a single
+    `lax.scan` over steps and per-ray masking for termination, avoiding the
+    older `vmap(scan(single_ray))` structure.
+    """
+    Y0_set = _initialize_ray_fan_state(freq, r_s, z_s, theta, beam_type=beam_type)
+    stepper = RK2_stepper(ray_eqns, ds, freq=freq, ati=ati, bty=bty)
+    trj = rollout_batched(stepper, int(R_max / ds), include_init=True)(Y0_set)
+    return jnp.swapaxes(trj, 0, 1)
+
 def compute_multiple_ray_paths(
     freq,
     r_s,
@@ -559,38 +649,19 @@ def compute_multiple_ray_paths(
     """
     Computes trajectories for an array of initial angles using vectorized integration.
     """
-    omega = 2 * jnp.pi * freq
-    delta_alpha = jnp.where(theta.shape[0] > 1, theta[1] - theta[0], 1.0)
-    n_theta = len(theta)
-    Y0_set = jnp.zeros((n_theta, 13), dtype=jnp.float64)
-    C0 = c(r_s, z_s)
-    rho = jnp.cos(theta) / C0
-    zeta = jnp.sin(theta) / C0
-    epsilon = (2 * C0**2) / (omega * delta_alpha**2 + 1e-12)
-    bellhop_beam = jnp.logical_or(beam_type == 'bellhop', beam_type == 'geometric')
-    q0_r = 0.0
-    q0_i = jnp.where(bellhop_beam, 1.0, epsilon)
-    p0_r = 1.0
-    p0_i = 0.0
-    tau_0 = 0.0
-    
-    Y0_set = Y0_set.at[:, 0].set(r_s) # r
-    Y0_set = Y0_set.at[:, 1].set(z_s) # z
-    Y0_set = Y0_set.at[:, 2].set(rho) # rho
-    Y0_set = Y0_set.at[:, 3].set(zeta) # zeta
-    Y0_set = Y0_set.at[:, 4].set(q0_r) # q_r
-    Y0_set = Y0_set.at[:, 5].set(q0_i) # q_i
-    Y0_set = Y0_set.at[:, 6].set(p0_r) # p_r
-    Y0_set = Y0_set.at[:, 7].set(p0_i) # p_i
-    Y0_set = Y0_set.at[:, 8].set(tau_0) # tau
-    Y0_set = Y0_set.at[:, 9].set(0.0) # n_surface
-    Y0_set = Y0_set.at[:, 10].set(0.0) # n_bottom
-    Y0_set = Y0_set.at[:, 11].set(0.0) # log_amp
-    Y0_set = Y0_set.at[:, 12].set(0.0) # phase
-
-    stepper = RK2_stepper(ray_eqns, ds, freq=freq, ati=ati, bty=bty)
-    trj = jax.vmap(rollout(stepper, int(R_max / ds), include_init=True))(Y0_set)
-    return trj
+    return compute_multiple_ray_paths_batched(
+        freq,
+        r_s,
+        z_s,
+        theta,
+        ray_eqns=ray_eqns,
+        ds=ds,
+        R_max=R_max,
+        Z_max=Z_max,
+        ati=ati,
+        bty=bty,
+        beam_type=beam_type,
+    )
 
 
 def _segment_reflection_factor(
@@ -1067,12 +1138,10 @@ def trace_beam_fan(
     Trace a launch fan suitable for Bellhop-style beam summation.
     """
     c0 = c(r_s, z_s)
-    n_beams_eff = jax.lax.cond(
-        auto_beam_count,
-        lambda _: bellhop_recommended_nbeams(freq, c0, R_max, theta_min, theta_max),
-        lambda _: jnp.asarray(n_beams, dtype=jnp.int32),
-        operand=None,
-    )
+    if auto_beam_count:
+        n_beams_eff = int(bellhop_recommended_nbeams(freq, c0, R_max, theta_min, theta_max))
+    else:
+        n_beams_eff = int(n_beams)
     theta = jnp.linspace(theta_min, theta_max, n_beams_eff, dtype=jnp.float64)
     source_amplitudes = evaluate_source_beam_pattern(theta, source_beam_pattern_angles_deg, source_beam_pattern_db)
     weights = jnp.ones_like(theta)
@@ -1116,6 +1185,8 @@ def solve_transmission_loss(
     auto_beam_count=False,
     source_beam_pattern_angles_deg=None,
     source_beam_pattern_db=None,
+    R_max=None,
+    Z_max=None,
     ati=ati,
     bty=bty,
 ):
@@ -1135,8 +1206,8 @@ def solve_transmission_loss(
         theta_max,
         n_beams,
         ds=ds,
-        R_max=float(rr_grid[-1]),
-        Z_max=float(rz_grid[-1]),
+        R_max=float(rr_grid[-1]) if R_max is None else R_max,
+        Z_max=float(rz_grid[-1]) if Z_max is None else Z_max,
         beam_type=beam_type,
         auto_beam_count=auto_beam_count,
         source_beam_pattern_angles_deg=source_beam_pattern_angles_deg,
@@ -1227,7 +1298,6 @@ def solve_transmission_loss(
         'theta': theta,
         'launch_weights': launch_weights,
         'source_amplitudes': source_amplitudes,
-        'run_mode': run_mode,
         'n_beams_recommended': bellhop_recommended_nbeams(freq, c0, float(rr_grid[-1]), theta_min, theta_max),
         'trajectories': trj_set,
         'field_per_beam': field_per_beam,
@@ -1334,6 +1404,8 @@ def solve_transmission_loss_autodiff(
     range_window_softness_m=None,
     source_beam_pattern_angles_deg=None,
     source_beam_pattern_db=None,
+    R_max=None,
+    Z_max=None,
     ati=ati,
     bty=bty,
 ):
@@ -1353,8 +1425,8 @@ def solve_transmission_loss_autodiff(
         theta_max,
         n_beams,
         ds=ds,
-        R_max=rr_grid[-1],
-        Z_max=rz_grid[-1],
+        R_max=float(rr_grid[-1]) if R_max is None else R_max,
+        Z_max=float(rz_grid[-1]) if Z_max is None else Z_max,
         beam_type=beam_type,
         auto_beam_count=auto_beam_count,
         source_beam_pattern_angles_deg=source_beam_pattern_angles_deg,
@@ -1395,7 +1467,6 @@ def solve_transmission_loss_autodiff(
         "theta": theta,
         "launch_weights": launch_weights,
         "source_amplitudes": source_amplitudes,
-        "run_mode": run_mode,
         "trajectories": trj_set,
         "field_per_beam": field_per_beam,
         "field_total_raw": field_total_raw,

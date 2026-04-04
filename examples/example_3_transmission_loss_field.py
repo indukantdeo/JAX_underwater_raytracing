@@ -10,6 +10,7 @@ sys.path.append('./')
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from plot import plot_environment
+from plot import plot_tl_field
 from simulation.boundary import altimetry as ati
 from simulation.boundary import bathymetry as bty
 from simulation.dynamic_ray_tracing import solve_transmission_loss
@@ -45,16 +46,15 @@ result = solve_transmission_loss(
 tl_db = result['tl_db']
 
 fig, ax = plt.subplots(figsize=(12, 5))
-im = ax.imshow(
+plot_tl_field(
+    rr_grid,
+    rz_grid,
     tl_db,
-    extent=[rr_grid[0] / 1000.0, rr_grid[-1] / 1000.0, rz_grid[-1], rz_grid[0]],
-    aspect='auto',
-    cmap='jet_r',
+    ax=ax,
+    title='Transmission Loss',
+    freq_hz=freq,
+    source_depth_m=z_s,
 )
-ax.set_xlabel('Range (km)')
-ax.set_ylabel('Depth (m)')
-ax.set_title(f'Transmission Loss at {freq:.1f} Hz')
-plt.colorbar(im, ax=ax, label='TL (dB)')
 
 fig_env, ax_env = plot_environment(
     rr_grid[-1],

@@ -17,6 +17,8 @@ if str(SRC) not in sys.path:
 if str(ROOT / "src" / "simulation") not in sys.path:
     sys.path.append(str(ROOT / "src" / "simulation"))
 
+from plot import bellhop_tl_color_limits, plot_tl_comparison, plot_tl_field
+
 try:
     from cases import BENCHMARK_CASES, get_bathymetry_sampler, get_ssp_sampler
     from metrics import safe_correlation, summarize_difference
@@ -142,48 +144,36 @@ def _resample_reference_to_solver_grid(reference: dict, solver_result: dict) -> 
 
 
 def _save_plots(case, solver_result: dict, reference: dict | None, out_dir: Path) -> None:
-    rr_km = solver_result["rr_grid_m"] / 1000.0
-    rz_m = solver_result["rz_grid_m"]
-
     fig, ax = plt.subplots(figsize=(12, 5))
-    im = ax.imshow(
+    plot_tl_field(
+        solver_result["rr_grid_m"],
+        solver_result["rz_grid_m"],
         solver_result["tl_db"],
-        extent=[rr_km[0], rr_km[-1], rz_m[-1], rz_m[0]],
-        aspect="auto",
-        cmap="jet_r",
+        ax=ax,
+        title=f"JAX TL field: {case.name}",
+        freq_hz=case.frequency_hz,
+        source_depth_m=case.source_depth_m,
     )
-    ax.set_title(f"JAX TL field: {case.name}")
-    ax.set_xlabel("Range (km)")
-    ax.set_ylabel("Depth (m)")
-    plt.colorbar(im, ax=ax, label="TL (dB)")
     fig.savefig(out_dir / f"{case.name}_jax_tl_field.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
     if reference is None:
         return
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    rr_ref_km = reference["rr_grid_m"] / 1000.0
-
-    images = [
-        (axes[0], reference["tl_db"], "Bellhop TL"),
-        (axes[1], solver_result["tl_db"], "JAX TL"),
-        (axes[2], solver_result["tl_db"] - reference["tl_db"], "Difference (JAX - Bellhop)"),
-    ]
-    for axis, field, title in images:
-        im = axis.imshow(
-            field,
-            extent=[rr_ref_km[0], rr_ref_km[-1], reference["rz_grid_m"][-1], reference["rz_grid_m"][0]],
-            aspect="auto",
-            cmap="jet_r" if "Difference" not in title else "coolwarm",
-        )
-        axis.set_title(title)
-        axis.set_xlabel("Range (km)")
-        axis.set_ylabel("Depth (m)")
-        plt.colorbar(im, ax=axis)
+    fig, axes = plot_tl_comparison(
+        reference["rr_grid_m"],
+        reference["rz_grid_m"],
+        reference["tl_db"],
+        solver_result["tl_db"],
+        title_prefix=case.name,
+        freq_hz=case.frequency_hz,
+        source_depth_m=case.source_depth_m,
+    )
     fig.savefig(out_dir / f"{case.name}_comparison_tl_field.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
+    tl_limits = bellhop_tl_color_limits(reference["tl_db"])
+    rr_ref_km = reference["rr_grid_m"] / 1000.0
     for depth_m in case.tl_slice_depths_m:
         iz = _nearest_depth_index(reference["rz_grid_m"], depth_m)
         fig, ax = plt.subplots(figsize=(10, 4))
@@ -192,7 +182,9 @@ def _save_plots(case, solver_result: dict, reference: dict | None, out_dir: Path
         ax.set_title(f"{case.name}: TL vs range at z={reference['rz_grid_m'][iz]:.1f} m")
         ax.set_xlabel("Range (km)")
         ax.set_ylabel("TL (dB)")
-        ax.grid(True)
+        ax.set_ylim(tl_limits[1], tl_limits[0])
+        ax.tick_params(direction="out")
+        ax.grid(True, alpha=0.3)
         ax.legend()
         fig.savefig(out_dir / f"{case.name}_slice_{int(round(depth_m))}m.png", dpi=200, bbox_inches="tight")
         plt.close(fig)
