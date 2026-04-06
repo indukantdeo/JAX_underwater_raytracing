@@ -1,0 +1,73 @@
+[
+  {
+    "case": "dickins",
+    "runtime_s": 10.871493173763156,
+    "frequency_hz": 230.0,
+    "n_beams_requested": 21,
+    "n_beams_actual": 21,
+    "n_beams_recommended": 482,
+    "auto_beam_count": false,
+    "source_amplitude_min": 1.0,
+    "source_amplitude_max": 1.0,
+    "ds_m": 5.0,
+    "timings_s": {
+      "launch_fan": 0.3927440196275711,
+      "ray_rollout": 8.922736996784806,
+      "accumulation": 1.1102705877274275,
+      "total_solver": 10.425751604139805
+    },
+    "storage": {
+      "store_field_per_beam": false,
+      "store_trajectories": false,
+      "beam_chunk_size_requested": 8,
+      "beam_chunk_size_used": 8,
+      "accumulation_backend": "windowed",
+      "precision": "float64"
+    },
+    "status": "validated_against_reference",
+    "field_metrics": {
+      "rmse": 76.51693210104432,
+      "mae": 65.55955032394621,
+      "max_abs_error": 231.9311904907226,
+      "p95_abs_error": 159.99998474121088,
+      "bias": 65.42016677817682,
+      "reference_mean": 106.96860181368314,
+      "candidate_mean": 172.38876859185999,
+      "correlation": 0.4227598605596439
+    },
+    "slice_metrics": {
+      "0.0m": {
+        "rmse": 73.65914327534674,
+        "mae": 63.3593158123912,
+        "max_abs_error": 211.60855102539057,
+        "p95_abs_error": 138.42230633309185,
+        "bias": 63.3593158123912,
+        "reference_mean": 107.86784568199745,
+        "candidate_mean": 171.22716149438864,
+        "correlation": 0.6277132655152138
+      },
+      "200.0m": {
+        "rmse": 84.97258469821226,
+        "mae": 76.70645515784278,
+        "max_abs_error": 227.8325805664062,
+        "p95_abs_error": 142.18001961429047,
+        "bias": 76.70645515784278,
+        "reference_mean": 94.77098729060246,
+        "candidate_mean": 171.4774424484453,
+        "correlation": 0.6301184225531369
+      },
+      "1000.0m": {
+        "rmse": 77.44928640975465,
+        "mae": 68.03001162587887,
+        "max_abs_error": 208.801040649414,
+        "p95_abs_error": 140.05564485364374,
+        "bias": 68.03001162587887,
+        "reference_mean": 102.01507685734676,
+        "candidate_mean": 170.0450884832256,
+        "correlation": 0.5592484065487252
+      }
+    },
+    "range_stride": 40,
+    "depth_stride": 40
+  }
+]

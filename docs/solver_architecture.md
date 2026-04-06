@@ -119,6 +119,19 @@ Two accumulation families are implemented:
 
 The output is a complex pressure field on the receiver grid, from which transmission loss is computed.
 
+For Bellhop-style validation runs, the production execution path is now optimized around chunked beam processing:
+
+- launch angles are split into fixed-size beam chunks
+- each chunk is traced and accumulated before the next chunk is launched
+- dense `field_per_beam` storage is optional instead of mandatory
+- trajectory retention is optional for TL-only benchmark runs
+
+This follows the same core acceleration ideas emphasized in parallel TRACEO implementations:
+
+- ray-level independence
+- separation of local contribution and global reduction
+- aggressive control of temporary memory use
+
 ### 5. Pressure Scaling and TL
 
 The field is postprocessed with Bellhop-style pressure scaling and then converted to:

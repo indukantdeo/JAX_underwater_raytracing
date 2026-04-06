@@ -315,6 +315,15 @@ Outputs:
 - TL-vs-range slice plots
 - JSON and Markdown reports
 
+Performance-oriented options:
+
+- `--beam-chunk-size <int>`
+  Process the launch fan in fixed-size beam chunks to reduce memory pressure.
+- `--accumulation-backend windowed|dense`
+  `windowed` is the optimized chunked Bellhop path; `dense` keeps the reference all-beam accumulation path for parity checks.
+- `--precision float64|float32`
+  `float64` is the default validation mode. `float32` is available for speed experiments.
+
 ## Example: Run The DickinsB Case In The JAX Solver
 
 `DickinsB.env` is the Bellhop reference case. In this repository, the matching JAX-side benchmark case is `dickins` in `validation/cases.py`.
@@ -340,6 +349,16 @@ If you want Bellhop-style beam-density selection instead of the fixed benchmark 
 
 ```bash
 JAX_underwater_raytracing/bin/python validation/run_benchmarks.py --case dickins --auto-beam-count
+```
+
+Example with chunked accumulation:
+
+```bash
+JAX_underwater_raytracing/bin/python validation/run_benchmarks.py \
+  --case dickins \
+  --beam-chunk-size 64 \
+  --accumulation-backend windowed \
+  --precision float64
 ```
 
 If you want to run the Dickins case directly from Python without the benchmark harness:
@@ -493,6 +512,202 @@ plot_tl_field(
     title="Transmission Loss",
     freq_hz=230.0,
     source_depth_m=18.0,
+)
+plt.show()
+```
+
+## Plotting Utilities Equivalent To Bellhop MATLAB Tools
+
+The plotting helpers in `src/plot.py` now include Bellhop-style wrapper names so you can work with solver outputs using function names similar to:
+
+- `plotshd`, `plotshd2`
+- `plotssp`, `plotssp2d`
+- `plotray`
+- `plottld`, `plottlr`
+- `plotbty`, `plotati`
+- `plotmovie`
+- `plottl_zf`
+
+### Full-Field TL Plot: `plotshd`
+
+```python
+import matplotlib.pyplot as plt
+from src.plot import plotshd
+
+fig, ax = plt.subplots(figsize=(12, 5))
+plotshd(
+    rr_grid_m=rr_grid,
+    rz_grid_m=rz_grid,
+    tl_db=result["tl_db"],
+    ax=ax,
+    title="Dickins TL",
+    freq_hz=230.0,
+    source_depth_m=18.0,
+)
+plt.show()
+```
+
+### Multi-Panel TL Plot: `plotshd2`
+
+```python
+import numpy as np
+from src.plot import plotshd2
+
+tl_fields = np.stack([result_a["tl_db"], result_b["tl_db"]], axis=0)
+fig, axes = plotshd2(
+    rr_grid_m=rr_grid,
+    rz_grid_m=rz_grid,
+    tl_fields=tl_fields,
+    titles=["Source depth = 10 m", "Source depth = 20 m"],
+)
+```
+
+### SSP Profile: `plotssp`
+
+```python
+import matplotlib.pyplot as plt
+from src.plot import plotssp
+
+fig, ax = plt.subplots(figsize=(6, 8))
+plotssp(
+    Z_max=5000.0,
+    c_fn=ssp_mod.MUNK_OPERATORS["c"],
+    r0=0.0,
+    ax=ax,
+)
+plt.show()
+```
+
+For a tabulated SSP:
+
+```python
+plotssp(
+    z_grid_m=z_knots_m,
+    c_values_mps=c_knots_mps,
+    sample_knots_z_m=z_knots_m,
+    sample_knots_c_mps=c_knots_mps,
+)
+```
+
+### 2D SSP Field: `plotssp2d`
+
+```python
+from src.plot import plotssp2d
+
+fig, ax = plotssp2d(
+    R_max=100000.0,
+    Z_max=5000.0,
+    c_fn=ssp_mod.MUNK_OPERATORS["c"],
+    units="km",
+)
+```
+
+### Ray Trajectories: `plotray`
+
+```python
+from src.plot import plotray
+
+fig, ax = plotray(
+    result["trajectories"],
+    units="km",
+    color_by_bounces=True,
+    grid=True,
+)
+```
+
+The ray plot colors are Bellhop-style:
+
+- red: direct path
+- green: surface only
+- blue: bottom only
+- black: both surface and bottom
+
+### TL vs Depth: `plottld`
+
+```python
+from src.plot import plottld
+
+fig, ax = plt.subplots(figsize=(6, 8))
+plottld(
+    rr_grid_m=rr_grid,
+    rz_grid_m=rz_grid,
+    tl_db=result["tl_db"],
+    receiver_range_km=20.0,
+    ax=ax,
+    title="TL vs Depth",
+    freq_hz=230.0,
+)
+plt.show()
+```
+
+### TL vs Range: `plottlr`
+
+```python
+from src.plot import plottlr
+
+fig, ax = plt.subplots(figsize=(10, 4))
+plottlr(
+    rr_grid_m=rr_grid,
+    rz_grid_m=rz_grid,
+    tl_db=result["tl_db"],
+    receiver_depth_m=250.0,
+    ax=ax,
+    title="TL vs Range",
+    freq_hz=230.0,
+    source_depth_m=18.0,
+)
+plt.show()
+```
+
+### Bathymetry And Altimetry: `plotbty`, `plotati`
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+from src.plot import plotati, plotbty
+
+rr_plot = np.linspace(0.0, 100000.0, 400)
+fig, ax = plt.subplots(figsize=(12, 5))
+plotbty(rr_plot, ax=ax, units="km", fill=True)
+plotati(rr_plot, ax=ax, units="km", fill=True)
+plt.show()
+```
+
+### TL Movie: `plotmovie`
+
+```python
+from src.plot import plotmovie
+
+field_sequence = np.stack(
+    [result_t0["field_total"], result_t1["field_total"], result_t2["field_total"]],
+    axis=0,
+)
+fig, anim = plotmovie(
+    rr_grid_m=rr_grid,
+    rz_grid_m=rz_grid,
+    field_sequence=field_sequence,
+    frame_values=[0.0, 1.0, 2.0],
+    db_scale=False,
+    units="m",
+    title="Field Evolution",
+)
+
+anim.save("tl_movie.gif", writer="pillow")
+```
+
+### TL vs Depth And Frequency: `plottl_zf`
+
+```python
+from src.plot import plottl_zf
+
+fig, ax = plt.subplots(figsize=(8, 5))
+plottl_zf(
+    frequencies_hz=freq_vec,
+    rz_grid_m=rz_grid,
+    tl_depth_frequency_db=tl_depth_frequency_db,
+    ax=ax,
+    title="TL(z, f)",
+    receiver_range_km=20.0,
 )
 plt.show()
 ```

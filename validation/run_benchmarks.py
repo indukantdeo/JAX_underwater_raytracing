@@ -63,7 +63,17 @@ def _configure_case(case, boundary_mod, dyn_mod, ssp_mod):
     dyn_mod.configure_acoustic_operators(sound_speed_operators, boundary_operators, reflection_model)
 
 
-def _run_solver(case, *, rr_grid=None, rz_grid=None, n_beams=None, auto_beam_count: bool | None = None):
+def _run_solver(
+    case,
+    *,
+    rr_grid=None,
+    rz_grid=None,
+    n_beams=None,
+    auto_beam_count: bool | None = None,
+    beam_chunk_size: int | None = None,
+    accumulation_backend: str = "windowed",
+    precision: str = "float64",
+):
     """Run one benchmark case and return a NumPy-native result bundle for reporting."""
     jnp, boundary_mod, dyn_mod, ssp_mod = _load_runtime_modules()
     _configure_case(case, boundary_mod, dyn_mod, ssp_mod)
@@ -90,6 +100,11 @@ def _run_solver(case, *, rr_grid=None, rz_grid=None, n_beams=None, auto_beam_cou
         auto_beam_count=auto_beam_count,
         source_beam_pattern_angles_deg=case.source_beam_pattern_angles_deg,
         source_beam_pattern_db=case.source_beam_pattern_db,
+        store_field_per_beam=False,
+        store_trajectories=False,
+        beam_chunk_size=beam_chunk_size,
+        accumulation_backend=accumulation_backend,
+        precision=precision,
     )
     runtime_s = time.perf_counter() - t0
 
@@ -104,6 +119,8 @@ def _run_solver(case, *, rr_grid=None, rz_grid=None, n_beams=None, auto_beam_cou
         "auto_beam_count": bool(auto_beam_count),
         "source_amplitude_min": float(np.min(np.asarray(result["source_amplitudes"]))),
         "source_amplitude_max": float(np.max(np.asarray(result["source_amplitudes"]))),
+        "timings_s": result["timings_s"],
+        "storage": result["storage"],
     }
 
 
@@ -203,6 +220,8 @@ def _build_report(case, solver_result: dict, reference: dict | None, out_dir: Pa
         "source_amplitude_min": solver_result["source_amplitude_min"],
         "source_amplitude_max": solver_result["source_amplitude_max"],
         "ds_m": case.ds_m,
+        "timings_s": solver_result["timings_s"],
+        "storage": solver_result["storage"],
     }
 
     if reference is None:
@@ -238,6 +257,13 @@ def _write_markdown_report(case, report: dict, out_dir: Path) -> None:
         f"- Source amplitude range: `[{report['source_amplitude_min']:.6f}, {report['source_amplitude_max']:.6f}]`",
         f"- Step size: `{case.ds_m:.2f} m`",
         f"- Solver runtime: `{report['runtime_s']:.6f} s`",
+        f"- Launch fan time: `{report['timings_s']['launch_fan']:.6f} s`",
+        f"- Ray rollout time: `{report['timings_s']['ray_rollout']:.6f} s`",
+        f"- Accumulation time: `{report['timings_s']['accumulation']:.6f} s`",
+        f"- Accumulation backend: `{report['storage']['accumulation_backend']}`",
+        f"- Precision: `{report['storage']['precision']}`",
+        f"- Beam chunk size requested: `{report['storage']['beam_chunk_size_requested']}`",
+        f"- Beam chunk size used: `{report['storage']['beam_chunk_size_used']}`",
         f"- Status: `{report['status']}`",
         "",
     ]
@@ -270,6 +296,9 @@ def run_case(
     *,
     n_beams_override: int | None = None,
     auto_beam_count_override: bool | None = None,
+    beam_chunk_size: int | None = None,
+    accumulation_backend: str = "windowed",
+    precision: str = "float64",
     range_stride: int = 1,
     depth_stride: int = 1,
 ) -> dict:
@@ -288,6 +317,9 @@ def run_case(
         rz_grid=rz_grid,
         n_beams=n_beams_override,
         auto_beam_count=auto_beam_count,
+        beam_chunk_size=beam_chunk_size,
+        accumulation_backend=accumulation_backend,
+        precision=precision,
     )
 
     reference = None
@@ -321,6 +353,9 @@ def main() -> None:
     parser.add_argument("--out-root", default="validation/results")
     parser.add_argument("--n-beams", type=int, default=None)
     parser.add_argument("--auto-beam-count", action="store_true")
+    parser.add_argument("--beam-chunk-size", type=int, default=None)
+    parser.add_argument("--accumulation-backend", choices=["windowed", "dense"], default="windowed")
+    parser.add_argument("--precision", choices=["float64", "float32"], default="float64")
     parser.add_argument("--range-stride", type=int, default=1)
     parser.add_argument("--depth-stride", type=int, default=1)
     args = parser.parse_args()
@@ -335,6 +370,9 @@ def main() -> None:
             out_root,
             n_beams_override=args.n_beams,
             auto_beam_count_override=args.auto_beam_count,
+            beam_chunk_size=args.beam_chunk_size,
+            accumulation_backend=args.accumulation_backend,
+            precision=args.precision,
             range_stride=args.range_stride,
             depth_stride=args.depth_stride,
         )

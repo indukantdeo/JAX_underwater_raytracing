@@ -39,6 +39,7 @@ from jax import core as jax_core
 import sys
 import os
 import functools
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Mapping, Literal
 
@@ -849,6 +850,113 @@ def _resolve_propagation_limits(rr_grid, rz_grid, R_max, Z_max):
     resolved_z_max = float(rz_grid[-1]) if Z_max is None else float(Z_max)
     return resolved_r_max, resolved_z_max
 
+
+def _resolve_precision(precision: str):
+    normalized = str(precision).strip().lower()
+    if normalized == "float32":
+        return normalized, jnp.float32, jnp.complex64
+    if normalized == "float64":
+        return normalized, jnp.float64, jnp.complex128
+    raise ValueError("precision must be 'float32' or 'float64'.")
+
+
+def _prepare_launch_fan(
+    freq,
+    r_s,
+    z_s,
+    theta_min,
+    theta_max,
+    n_beams,
+    *,
+    auto_beam_count,
+    source_beam_pattern_angles_deg,
+    source_beam_pattern_db,
+    dtype,
+    r_max,
+):
+    c0 = c(r_s, z_s)
+    n_beams_recommended = bellhop_recommended_nbeams(freq, c0, r_max, theta_min, theta_max)
+    n_beams_eff = int(n_beams_recommended) if auto_beam_count else int(n_beams)
+    theta = jnp.linspace(theta_min, theta_max, n_beams_eff, dtype=dtype)
+    source_amplitudes = evaluate_source_beam_pattern(theta, source_beam_pattern_angles_deg, source_beam_pattern_db).astype(dtype)
+    weights = jnp.ones_like(theta)
+    if n_beams_eff > 1:
+        weights = weights.at[0].set(0.5).at[-1].set(0.5)
+    return theta, weights.astype(dtype), source_amplitudes, n_beams_recommended
+
+
+def _trace_beam_chunk(
+    freq,
+    r_s,
+    z_s,
+    theta_chunk,
+    *,
+    ds,
+    r_max,
+    z_max,
+    ati,
+    bty,
+    beam_type,
+):
+    return compute_multiple_ray_paths(
+        freq,
+        r_s,
+        z_s,
+        theta_chunk,
+        ds=ds,
+        R_max=r_max,
+        Z_max=z_max,
+        ati=ati,
+        bty=bty,
+        beam_type=beam_type,
+    )
+
+
+def _make_bellhop_beam_solver(
+    accumulation_model,
+    *,
+    freq,
+    z_s,
+    delta_alpha,
+    rr_grid,
+    rz_grid,
+    run_mode,
+    min_width_m,
+):
+    run_type_e = 'C' if run_mode == 'coherent' else 'S'
+    bellhop_style = accumulation_model in ('hat', 'gaussian')
+
+    if accumulation_model == 'gaussian':
+        solver = jax.vmap(
+            lambda trj, launch_angle, source_amplitude: InfluenceGeoGaussian(
+                freq, trj, z_s, launch_angle, source_amplitude, delta_alpha, rr_grid, rz_grid, RunTypeE=run_type_e
+            ),
+            in_axes=(0, 0, 0),
+        )
+    elif accumulation_model == 'hat':
+        solver = jax.vmap(
+            lambda trj, launch_angle, source_amplitude: InfluenceGeoHat(
+                freq, trj, z_s, launch_angle, source_amplitude, delta_alpha, rr_grid, rz_grid, RunTypeE=run_type_e
+            ),
+            in_axes=(0, 0, 0),
+        )
+    else:
+        solver = jax.vmap(
+            lambda trj, launch_angle, source_amplitude: accumulate_geometric_gaussian_field(
+                freq,
+                trj,
+                launch_angle,
+                source_amplitude,
+                delta_alpha,
+                rr_grid,
+                rz_grid,
+                min_width_m,
+                coherent=run_mode == 'coherent',
+            ),
+            in_axes=(0, 0, 0),
+        )
+    return solver, bellhop_style
+
 @functools.partial(jax.jit, static_argnames=('RunTypeE',))
 def InfluenceGeoGaussian(freq, single_trj, z_s, source_takeoff_angle, source_amplitude, delta_alpha, rr_grid, rz_grid, RunTypeE='S'):
     
@@ -1292,6 +1400,11 @@ def solve_transmission_loss(
     auto_beam_count=False,
     source_beam_pattern_angles_deg=None,
     source_beam_pattern_db=None,
+    store_field_per_beam=False,
+    store_trajectories=True,
+    beam_chunk_size=None,
+    accumulation_backend="windowed",
+    precision="float64",
     R_max=None,
     Z_max=None,
     ati=ati,
@@ -1346,99 +1459,125 @@ def solve_transmission_loss(
         beam_type,
     )
     R_max, Z_max = _resolve_propagation_limits(rr_grid, rz_grid, R_max, Z_max)
+    precision_mode, real_dtype, complex_dtype = _resolve_precision(precision)
+    freq = real_dtype(freq)
+    r_s = real_dtype(r_s)
+    z_s = real_dtype(z_s)
+    theta_min = real_dtype(theta_min)
+    theta_max = real_dtype(theta_max)
+    rr_grid = jnp.asarray(rr_grid, dtype=real_dtype)
+    rz_grid = jnp.asarray(rz_grid, dtype=real_dtype)
 
-    theta, launch_weights, source_amplitudes, trj_set = trace_beam_fan(
+    t_launch_start = time.perf_counter()
+    theta, launch_weights, source_amplitudes, n_beams_recommended = _prepare_launch_fan(
         freq,
         r_s,
         z_s,
         theta_min,
         theta_max,
         n_beams,
-        ds=ds,
-        R_max=R_max,
-        Z_max=Z_max,
-        beam_type=beam_type,
         auto_beam_count=auto_beam_count,
         source_beam_pattern_angles_deg=source_beam_pattern_angles_deg,
         source_beam_pattern_db=source_beam_pattern_db,
-        ati=ati,
-        bty=bty,
+        dtype=real_dtype,
+        r_max=R_max,
     )
+    launch_fan_s = time.perf_counter() - t_launch_start
+
     c0 = c(r_s, z_s)
     delta_alpha = jnp.where(theta.shape[0] > 1, theta[1] - theta[0], 1.0)
     wavelength = c0 / freq
     min_width_m = min_width_wavelengths * wavelength
+    if accumulation_backend not in {"windowed", "dense"}:
+        raise ValueError("accumulation_backend must be 'windowed' or 'dense'.")
 
-    if accumulation_model == 'gaussian':
-        beam_solver = jax.vmap(
-            lambda trj, launch_angle, source_amplitude: InfluenceGeoGaussian(
-                freq,
-                trj,
-                z_s,
-                launch_angle,
-                source_amplitude,
-                delta_alpha,
-                rr_grid,
-                rz_grid,
-                RunTypeE='C' if run_mode == 'coherent' else 'S',
-            ),
-            in_axes=(0, 0, 0),
-        )
-    elif accumulation_model == 'hat':
-        beam_solver = jax.vmap(
-            lambda trj, launch_angle, source_amplitude: InfluenceGeoHat(
-                freq,
-                trj,
-                z_s,
-                launch_angle,
-                source_amplitude,
-                delta_alpha,
-                rr_grid,
-                rz_grid,
-                RunTypeE='C' if run_mode == 'coherent' else 'S',
-            ),
-            in_axes=(0, 0, 0),
-        )
-    elif beam_type == 'geometric':
-        beam_solver = jax.vmap(
-            lambda trj, launch_angle, source_amplitude: accumulate_geometric_gaussian_field(
-                freq,
-                trj,
-                launch_angle,
-                source_amplitude,
-                delta_alpha,
-                rr_grid,
-                rz_grid,
-                min_width_m,
-                coherent=run_mode == 'coherent',
-            ),
-            in_axes=(0, 0, 0),
-        )
-    else:
-        beam_solver = jax.vmap(
-            lambda trj, launch_angle, source_amplitude: InfluenceGeoGaussian(
-                freq,
-                trj,
-                z_s,
-                launch_angle,
-                source_amplitude,
-                delta_alpha,
-                rr_grid,
-                rz_grid,
-                RunTypeE='C' if run_mode == 'coherent' else 'S',
-            ),
-            in_axes=(0, 0, 0),
-        )
-
-    field_per_beam = beam_solver(trj_set, theta, source_amplitudes)
-    bellhop_style = accumulation_model in ('hat', 'gaussian')
-    field_per_beam = jax.lax.cond(
-        bellhop_style,
-        lambda fpb: fpb,
-        lambda fpb: fpb * launch_weights[:, None, None],
-        field_per_beam,
+    beam_solver, bellhop_style = _make_bellhop_beam_solver(
+        accumulation_model,
+        freq=freq,
+        z_s=z_s,
+        delta_alpha=delta_alpha,
+        rr_grid=rr_grid,
+        rz_grid=rz_grid,
+        run_mode=run_mode,
+        min_width_m=min_width_m,
     )
-    field_total_raw = jnp.sum(field_per_beam, axis=0)
+    n_total_beams = int(theta.shape[0])
+    effective_beam_chunk_size = n_total_beams if beam_chunk_size is None else max(1, min(int(beam_chunk_size), n_total_beams))
+    trace_time_s = 0.0
+    accumulation_time_s = 0.0
+
+    if accumulation_backend == "dense":
+        t_trace_start = time.perf_counter()
+        trajectories = _trace_beam_chunk(
+            freq,
+            r_s,
+            z_s,
+            theta,
+            ds=ds,
+            r_max=R_max,
+            z_max=Z_max,
+            ati=ati,
+            bty=bty,
+            beam_type=beam_type,
+        )
+        trace_time_s = time.perf_counter() - t_trace_start
+
+        t_accum_start = time.perf_counter()
+        field_per_beam = beam_solver(trajectories, theta, source_amplitudes)
+        if not bellhop_style:
+            field_per_beam = field_per_beam * launch_weights[:, None, None]
+        field_total_raw = jnp.sum(field_per_beam, axis=0)
+        accumulation_time_s = time.perf_counter() - t_accum_start
+        if not store_field_per_beam:
+            field_per_beam = None
+        if not store_trajectories:
+            trajectories = None
+    else:
+        field_total_raw = jnp.zeros((rz_grid.shape[0], rr_grid.shape[0]), dtype=complex_dtype)
+        stored_field_chunks = [] if store_field_per_beam else None
+        stored_trj_chunks = [] if store_trajectories else None
+
+        for start in range(0, n_total_beams, effective_beam_chunk_size):
+            stop = min(start + effective_beam_chunk_size, n_total_beams)
+            theta_chunk = theta[start:stop]
+            weight_chunk = launch_weights[start:stop]
+            amplitude_chunk = source_amplitudes[start:stop]
+
+            t_trace_start = time.perf_counter()
+            trj_chunk = _trace_beam_chunk(
+                freq,
+                r_s,
+                z_s,
+                theta_chunk,
+                ds=ds,
+                r_max=R_max,
+                z_max=Z_max,
+                ati=ati,
+                bty=bty,
+                beam_type=beam_type,
+            )
+            trace_time_s += time.perf_counter() - t_trace_start
+
+            t_accum_start = time.perf_counter()
+            field_chunk = beam_solver(trj_chunk, theta_chunk, amplitude_chunk)
+            if not bellhop_style:
+                field_chunk = field_chunk * weight_chunk[:, None, None]
+            field_total_raw = field_total_raw + jnp.sum(field_chunk, axis=0)
+            accumulation_time_s += time.perf_counter() - t_accum_start
+
+            if store_field_per_beam:
+                stored_field_chunks.append(field_chunk)
+            if store_trajectories:
+                stored_trj_chunks.append(trj_chunk)
+
+        field_per_beam = None
+        if store_field_per_beam:
+            field_per_beam = jnp.concatenate(stored_field_chunks, axis=0)
+
+        trajectories = None
+        if store_trajectories:
+            trajectories = jnp.concatenate(stored_trj_chunks, axis=0)
+
     field_total = scale_pressure_bellhop(freq, delta_alpha, c0, rr_grid, field_total_raw, run_mode=run_mode)
     energy = jnp.abs(field_total)
     tl_db = -20.0 * jnp.log10(energy + 1e-16)
@@ -1447,12 +1586,26 @@ def solve_transmission_loss(
         'theta': theta,
         'launch_weights': launch_weights,
         'source_amplitudes': source_amplitudes,
-        'n_beams_recommended': bellhop_recommended_nbeams(freq, c0, float(rr_grid[-1]), theta_min, theta_max),
-        'trajectories': trj_set,
+        'n_beams_recommended': n_beams_recommended,
+        'trajectories': trajectories,
         'field_per_beam': field_per_beam,
         'field_total_raw': field_total_raw,
         'field_total': field_total,
         'tl_db': tl_db,
+        'timings_s': {
+            'launch_fan': launch_fan_s,
+            'ray_rollout': trace_time_s,
+            'accumulation': accumulation_time_s,
+            'total_solver': launch_fan_s + trace_time_s + accumulation_time_s,
+        },
+        'storage': {
+            'store_field_per_beam': bool(store_field_per_beam),
+            'store_trajectories': bool(store_trajectories),
+            'beam_chunk_size_requested': None if beam_chunk_size is None else int(beam_chunk_size),
+            'beam_chunk_size_used': int(effective_beam_chunk_size),
+            'accumulation_backend': accumulation_backend,
+            'precision': precision_mode,
+        },
     }
 
 
